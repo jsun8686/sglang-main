@@ -224,7 +224,7 @@ class ModelSlimConfig(QuantizationConfig):
                 logger.info_once(f"Using {scheme_class.__name__}")
                 return scheme_class(quant_config=self.quant_description, prefix=prefix)
 
-        logger.warning(
+        logger.debug(
             f"Unsupported Linear modelslim scheme: "
             f"{quant_schemes} in layer: {prefix}"
         )
