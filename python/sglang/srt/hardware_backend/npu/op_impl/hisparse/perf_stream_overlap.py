@@ -14,6 +14,10 @@ hardware-level cross-stream parallelism (DMA vs compute overlap):
   Exp 2: sieve_update vs scatter_from_host (AIV+MTE vs MTE).
          Production workload: plan kernel (sieve) overlaps with IO kernel (scatter).
 
+  Exp 2c: AIC (matmul) vs AIV (scatter) parallelism.
+          Tests whether 24 AIC and 48 AIV are physically independent.
+          If yes, matmul(AIC) and scatter(AIV) should overlap with ~0 contention.
+
   Exp 3: Core-partition sweep (bd_a + bd_b = 48).
          Finds optimal core split for plan-then-IO overlap.
 
@@ -549,6 +553,84 @@ def run_experiment_2(
         serial = measure_serial(fn_sieve, fn_scatter)
         parallel = measure_parallel(fn_sieve, fn_scatter)
         report(label, serial, parallel)
+
+
+# ===========================================================================
+# Experiment 2c: AIC (matmul) vs AIV (scatter) parallelism verification
+# ===========================================================================
+#
+# All prior experiments tested AIV-vs-AIV (sieve on AIV compute, scatter on
+# AIV MTE).  This experiment tests AIC-vs-AIV: matmul runs on 24 AIC (Cube),
+# scatter runs on 48 AIV (MTE).  If AIC and AIV are physically independent,
+# overlap should approach the theoretical maximum.
+#
+# This is the critical isolation test:
+#   sieve(48) vs scatter(48) = -8.2%   (AIV vs AIV, same cores)
+#   matmul    vs scatter(48) = ???     (AIC vs AIV, different cores)
+
+MATMUL_SCATTER_CONFIGS = [
+    (2048,  20),   # ~1.3ms — shorter than scatter (3.1ms)
+    (4096,  20),   # ~8.6ms — longer than scatter
+    (8192,  50),   # ~190ms — much longer than scatter
+]
+
+
+def run_experiment_2c(
+    device: str,
+    state: Dict[str, torch.Tensor],
+    host_kv_dev_ptr: int,
+    block_dim: int = 48,
+) -> None:
+    print("=" * 72)
+    print("Experiment 2c: AIC (matmul) vs AIV (scatter) parallelism")
+    print("  Purpose: Are 24 AIC and 48 AIV physically independent?")
+    print("  If yes, matmul(AIC) and scatter(AIV) should overlap with ~0 contention.")
+    print("=" * 72)
+
+    from sglang.srt.hardware_backend.npu.op_impl.hisparse import scatter_from_host_npu
+
+    _pre_populate_for_scatter(state, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
+
+    def fn_scatter(s=state):
+        scatter_from_host_npu(
+            host_kv_cache_ptr=host_kv_dev_ptr,
+            topk_indices=s["topk_indices"],
+            top_k_device_slots=s["top_k_device_slots"],
+            is_miss=s["is_miss"],
+            req_pool_indices=s["req_pool_indices"],
+            req_to_host_pool=s["req_to_host_pool"],
+            req_to_device_buffer=s["req_to_device_buffer"],
+            device_k_buffer=s["device_k_buffer"],
+            device_v_buffer=s["device_v_buffer"],
+            layer_id=0,
+            host_entries=MAX_CONTEXT_LEN,
+            k_row_bytes=K_ROW_BYTES,
+            v_row_bytes=V_ROW_BYTES,
+            max_context_len=MAX_CONTEXT_LEN,
+            device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+            padded_buffer_size=PADDED_BUFFER_SIZE,
+            max_num_reqs=NUM_REQS,
+            top_k=TOP_K,
+            block_dim=block_dim,
+        )
+
+    for n, reps in MATMUL_SCATTER_CONFIGS:
+        mat_a = torch.randn(n, n, dtype=torch.float16, device=device)
+        mat_b = torch.randn(n, n, dtype=torch.float16, device=device)
+        mat_c = torch.empty_like(mat_a)
+
+        def fn_matmul(_a=mat_a, _b=mat_b, _c=mat_c, _r=reps):
+            for _ in range(_r):
+                torch.matmul(_a, _b, out=_c)
+
+        label = f"matmul({n}x{n})x{reps} [AIC] vs scatter(bd={block_dim}) [AIV]"
+        print(f"\n  {label}")
+        serial = measure_serial(fn_matmul, fn_scatter)
+        parallel = measure_parallel(fn_matmul, fn_scatter)
+        report(label, serial, parallel)
+
+        del mat_a, mat_b, mat_c
+        torch.npu.empty_cache()
 
 
 # ===========================================================================
@@ -1454,7 +1536,7 @@ def main():
     )
     parser.add_argument(
         "--exp", type=str, default="0",
-        choices=["0", "1", "2", "3", "4", "4b", "all"],
+        choices=["0", "1", "2", "2c", "3", "4", "4b", "all"],
         help="Which experiment to run (default: 0)",
     )
     parser.add_argument(
@@ -1492,6 +1574,7 @@ def main():
     run_exp0 = args.exp in ("0", "all")
     run_exp1 = args.exp in ("1", "all")
     run_exp2 = args.exp in ("2", "all")
+    run_exp2c = args.exp in ("2c", "all")
     run_exp3 = args.exp in ("3", "all")
     run_exp4 = args.exp in ("4", "all")
     run_exp4b = args.exp in ("4b", "all")
@@ -1501,8 +1584,8 @@ def main():
     if run_exp0:
         run_experiment_0(device)
 
-    # --- Experiments 1, 2, 3, 4, 4b (require kernel build) ---
-    if run_exp1 or run_exp2 or run_exp3 or run_exp4 or run_exp4b:
+    # --- Experiments 1, 2, 2c, 3, 4, 4b (require kernel build) ---
+    if run_exp1 or run_exp2 or run_exp2c or run_exp3 or run_exp4 or run_exp4b:
         from sglang.srt.hardware_backend.npu.op_impl import hisparse as hisparse_pkg
         if not hisparse_pkg._HAS_KERNEL:
             print("\nERROR: hisparse_lru native extension not built.")
@@ -1536,6 +1619,9 @@ def main():
                     device, state_a, state_b, host_kv_dev_ptr,
                     bd_configs=[(1, 1), (8, 4), (4, 44), (48, 48)],
                 )
+
+            if run_exp2c:
+                run_experiment_2c(device, state_a, host_kv_dev_ptr)
 
             if run_exp3:
                 run_experiment_3(
