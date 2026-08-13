@@ -537,6 +537,195 @@ def run_experiment_2(
 
 
 # ===========================================================================
+# Experiment 3: Core-partition sweep (bd_a + bd_b = 48)
+# ===========================================================================
+
+# Production core partitions to sweep.  Total = 48 (full chip).
+# sieve is compute-light → give it few cores; scatter is DMA-heavy → give it
+# the rest.  The sweep finds the sweet spot.
+PARTITION_CONFIGS = [
+    (1, 47),
+    (2, 46),
+    (4, 44),
+    (8, 40),
+    (16, 32),
+    (24, 24),
+    (32, 16),
+    (40, 8),
+]
+
+
+def run_experiment_3(
+    device: str,
+    state_a: Dict[str, torch.Tensor],
+    state_b: Dict[str, torch.Tensor],
+    host_kv_dev_ptr: int,
+) -> None:
+    print("=" * 72)
+    print("Experiment 3: Core-partition sweep (bd_a + bd_b = 48)")
+    print("  Purpose: Find optimal core split for plan-then-IO overlap.")
+    print("  Tests both scatter-vs-scatter and sieve-vs-scatter.")
+    print("=" * 72)
+
+    from sglang.srt.hardware_backend.npu.op_impl.hisparse import (
+        sieve_update_npu,
+        scatter_from_host_npu,
+    )
+
+    # ---- Part A: scatter vs scatter (MTE vs MTE) partition sweep ----
+    print("\n--- Part A: scatter vs scatter (bd_a + bd_b = 48) ---\n")
+    _pre_populate_for_scatter(state_a, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
+    _pre_populate_for_scatter(state_b, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
+
+    results_svs = []
+    for bd_a, bd_b in PARTITION_CONFIGS:
+        def fn_scatter_a(sa=state_a, _bd=bd_a):
+            scatter_from_host_npu(
+                host_kv_cache_ptr=host_kv_dev_ptr,
+                topk_indices=sa["topk_indices"],
+                top_k_device_slots=sa["top_k_device_slots"],
+                is_miss=sa["is_miss"],
+                req_pool_indices=sa["req_pool_indices"],
+                req_to_host_pool=sa["req_to_host_pool"],
+                req_to_device_buffer=sa["req_to_device_buffer"],
+                device_k_buffer=sa["device_k_buffer"],
+                device_v_buffer=sa["device_v_buffer"],
+                layer_id=0,
+                host_entries=MAX_CONTEXT_LEN,
+                k_row_bytes=K_ROW_BYTES,
+                v_row_bytes=V_ROW_BYTES,
+                max_context_len=MAX_CONTEXT_LEN,
+                device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+                padded_buffer_size=PADDED_BUFFER_SIZE,
+                max_num_reqs=NUM_REQS,
+                top_k=TOP_K,
+                block_dim=_bd,
+            )
+
+        def fn_scatter_b(sb=state_b, _bd=bd_b):
+            scatter_from_host_npu(
+                host_kv_cache_ptr=host_kv_dev_ptr,
+                topk_indices=sb["topk_indices"],
+                top_k_device_slots=sb["top_k_device_slots"],
+                is_miss=sb["is_miss"],
+                req_pool_indices=sb["req_pool_indices"],
+                req_to_host_pool=sb["req_to_host_pool"],
+                req_to_device_buffer=sb["req_to_device_buffer"],
+                device_k_buffer=sb["device_k_buffer"],
+                device_v_buffer=sb["device_v_buffer"],
+                layer_id=1,
+                host_entries=MAX_CONTEXT_LEN,
+                k_row_bytes=K_ROW_BYTES,
+                v_row_bytes=V_ROW_BYTES,
+                max_context_len=MAX_CONTEXT_LEN,
+                device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+                padded_buffer_size=PADDED_BUFFER_SIZE,
+                max_num_reqs=NUM_REQS,
+                top_k=TOP_K,
+                block_dim=_bd,
+            )
+
+        label = f"scatter({bd_a:2d}) vs scatter({bd_b:2d})"
+        serial = measure_serial(fn_scatter_a, fn_scatter_b)
+        parallel = measure_parallel(fn_scatter_a, fn_scatter_b)
+        report(label, serial, parallel)
+
+        s_total = _median(serial["total"])
+        p_total = _median(parallel["total"])
+        overlap = 1.0 - p_total / s_total if s_total > 0 else 0.0
+        results_svs.append((bd_a, bd_b, s_total, p_total, overlap,
+                            _median(serial["a"]), _median(serial["b"]),
+                            _median(parallel["a"]), _median(parallel["b"])))
+
+    _print_summary_table("scatter vs scatter", results_svs)
+
+    # ---- Part B: sieve vs scatter partition sweep ----
+    print("\n--- Part B: sieve vs scatter (bd_a + bd_b = 48) ---\n")
+    # Re-init state_a for sieve
+    state_a["topk_indices"].copy_(
+        _gen_topk(device, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE, MISS_RATIO)
+    )
+    _init_tokens(state_a, DEVICE_BUFFER_SIZE)
+    # Re-init state_b for scatter
+    _pre_populate_for_scatter(state_b, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
+
+    results_svs2 = []
+    for bd_a, bd_b in PARTITION_CONFIGS:
+        def fn_sieve(sa=state_a, _bd=bd_a):
+            sieve_update_npu(
+                layer_id=0,
+                topk_indices=sa["topk_indices"],
+                req_pool_indices=sa["req_pool_indices"],
+                seq_lens=sa["seq_lens"],
+                prefill_len=sa["prefill_len"],
+                device_buffer_tokens=sa["device_buffer_tokens"],
+                device_buffer_visited=sa["device_buffer_visited"],
+                device_buffer_ht=sa["device_buffer_ht"][0],
+                sieve_hand=sa["sieve_hand"],
+                top_k_device_slots=sa["top_k_device_slots"],
+                is_miss=sa["is_miss"],
+                num_real_reqs=sa["num_real_reqs"],
+                top_k=TOP_K,
+                device_buffer_size=DEVICE_BUFFER_SIZE,
+                padded_buffer_size=PADDED_BUFFER_SIZE,
+                max_num_reqs=NUM_REQS,
+                block_dim=_bd,
+            )
+
+        def fn_scatter(sb=state_b, _bd=bd_b):
+            scatter_from_host_npu(
+                host_kv_cache_ptr=host_kv_dev_ptr,
+                topk_indices=sb["topk_indices"],
+                top_k_device_slots=sb["top_k_device_slots"],
+                is_miss=sb["is_miss"],
+                req_pool_indices=sb["req_pool_indices"],
+                req_to_host_pool=sb["req_to_host_pool"],
+                req_to_device_buffer=sb["req_to_device_buffer"],
+                device_k_buffer=sb["device_k_buffer"],
+                device_v_buffer=sb["device_v_buffer"],
+                layer_id=1,
+                host_entries=MAX_CONTEXT_LEN,
+                k_row_bytes=K_ROW_BYTES,
+                v_row_bytes=V_ROW_BYTES,
+                max_context_len=MAX_CONTEXT_LEN,
+                device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+                padded_buffer_size=PADDED_BUFFER_SIZE,
+                max_num_reqs=NUM_REQS,
+                top_k=TOP_K,
+                block_dim=_bd,
+            )
+
+        label = f"sieve({bd_a:2d}) vs scatter({bd_b:2d})"
+        serial = measure_serial(fn_sieve, fn_scatter)
+        parallel = measure_parallel(fn_sieve, fn_scatter)
+        report(label, serial, parallel)
+
+        s_total = _median(serial["total"])
+        p_total = _median(parallel["total"])
+        overlap = 1.0 - p_total / s_total if s_total > 0 else 0.0
+        results_svs2.append((bd_a, bd_b, s_total, p_total, overlap,
+                             _median(serial["a"]), _median(serial["b"]),
+                             _median(parallel["a"]), _median(parallel["b"])))
+
+    _print_summary_table("sieve vs scatter", results_svs2)
+
+
+def _print_summary_table(title: str, results: List[Tuple]) -> None:
+    """Print a compact summary table of partition sweep results."""
+    print(f"\n  ┌─────────────────────────────────────────────────────────────────────────┐")
+    print(f"  │ Summary: {title:<66}│")
+    print(f"  ├──────┬──────┬──────────┬──────────┬──────────┬──────────────────────┤")
+    print(f"  │ bd_a │ bd_b │ serial   │ parallel │ overlap  │ A_par   B_par        │")
+    print(f"  │      │      │ (ms)     │ (ms)     │ (%)      │ (ms)    (ms)        │")
+    print(f"  ├──────┼──────┼──────────┼──────────┼──────────┼──────────────────────┤")
+    for bd_a, bd_b, s, p, ov, sa, sb, pa, pb in results:
+        tag = " <<<" if ov == max(r[4] for r in results) else ""
+        print(f"  │ {bd_a:4d} │ {bd_b:4d} │ {s:8.3f}  │ {p:8.3f}  │ {ov*100:6.1f}%  │ "
+              f"{pa:7.3f}  {pb:7.3f}     │{tag}")
+    print(f"  └──────┴──────┴──────────┴──────────┴──────────┴──────────────────────┘")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -548,7 +737,7 @@ def main():
     )
     parser.add_argument(
         "--exp", type=str, default="0",
-        choices=["0", "1", "2", "all"],
+        choices=["0", "1", "2", "3", "all"],
         help="Which experiment to run (default: 0)",
     )
     parser.add_argument(
@@ -581,13 +770,14 @@ def main():
     run_exp0 = args.exp in ("0", "all")
     run_exp1 = args.exp in ("1", "all")
     run_exp2 = args.exp in ("2", "all")
+    run_exp3 = args.exp in ("3", "all")
 
     # --- Experiment 0 ---
     if run_exp0:
         run_experiment_0(device)
 
-    # --- Experiments 1 & 2 (require kernel build) ---
-    if run_exp1 or run_exp2:
+    # --- Experiments 1, 2, 3 (require kernel build) ---
+    if run_exp1 or run_exp2 or run_exp3:
         from sglang.srt.hardware_backend.npu.op_impl import hisparse as hisparse_pkg
         if not hisparse_pkg._HAS_KERNEL:
             print("\nERROR: hisparse_lru native extension not built.")
@@ -621,6 +811,11 @@ def main():
                 run_experiment_2(
                     device, state_a, state_b, host_kv_dev_ptr,
                     bd_configs=[(1, 1), (8, 4)],
+                )
+
+            if run_exp3:
+                run_experiment_3(
+                    device, state_a, state_b, host_kv_dev_ptr,
                 )
 
             del state_a, state_b
