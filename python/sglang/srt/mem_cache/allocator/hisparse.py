@@ -113,7 +113,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(logical_indices)
             return None
 
-        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
+        self.full_to_hisparse_device_index_mapping[logical_indices.to(torch.int64)] = (
+            hisparse_indices.to(torch.int64)
+        )
         return logical_indices
 
     def alloc_logical_only(
@@ -144,8 +146,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         assert need_size % self.page_size == 0
         # clear original reference and isolate the buffer from outside addressing
-        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        allocated_indices_i64 = allocated_indices.to(torch.int64)
+        hisparse_indices = self.full_to_hisparse_device_index_mapping[
+            allocated_indices_i64
+        ]
+        self.full_to_hisparse_device_index_mapping[allocated_indices_i64] = 0
         if head_keep > 0 or tail_keep > 0:
             # Long sequences: keep the first head_keep and last tail_keep
             # slots (page-aligned head/tail of the device buffer) and release
@@ -261,7 +266,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             hisparse_indices is not None
         ), "Hisparse allocation failed in alloc_extend"
-        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
+        self.full_to_hisparse_device_index_mapping[logical_indices.to(torch.int64)] = (
+            hisparse_indices.to(torch.int64)
+        )
         return logical_indices
 
     def alloc_decode(
@@ -278,7 +285,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         self.free_hisparse_indices(hisparse_indices)
-        self.full_to_hisparse_device_index_mapping[free_indices] = 0
+        self.full_to_hisparse_device_index_mapping[free_indices.to(torch.int64)] = 0
 
     def clear(self):
         self.logical_attn_allocator.clear()

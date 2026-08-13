@@ -1471,7 +1471,7 @@ class HiSparseCoordinator:
             req.req_pool_idx, : req.kv_allocated_len
         ]
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
-            allocated_locs
+            allocated_locs.to(torch.int64)
         ] = 0
 
         host_allocated_len = int(self.req_host_allocated_len[req.req_pool_idx].item())
@@ -1514,8 +1514,8 @@ class HiSparseCoordinator:
             self.req_to_device_buffer[req_pool_indices, col_indices] = new_slots
             self.req_decode_buffer_capacity[req_pool_indices] = decode_offsets + 1
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                out_cache_loc
-            ] = new_slots
+                out_cache_loc.to(torch.int64)
+            ] = new_slots.to(torch.int64)
             return
 
         needs_alloc = decode_offsets % page_size == 0
@@ -1547,8 +1547,8 @@ class HiSparseCoordinator:
         page_aligned_cap = (raw_cap + page_size - 1) // page_size * page_size
         self.req_decode_buffer_capacity[req_pool_indices] = page_aligned_cap
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
-            out_cache_loc
-        ] = device_indices
+            out_cache_loc.to(torch.int64)
+        ] = device_indices.to(torch.int64)
 
     def get_front_topk_tokens(
         self,
