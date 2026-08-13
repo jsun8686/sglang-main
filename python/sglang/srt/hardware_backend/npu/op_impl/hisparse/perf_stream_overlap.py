@@ -1534,7 +1534,7 @@ def main():
             if run_exp2:
                 run_experiment_2(
                     device, state_a, state_b, host_kv_dev_ptr,
-                    bd_configs=[(1, 1), (8, 4)],
+                    bd_configs=[(1, 1), (8, 4), (4, 44), (48, 48)],
                 )
 
             if run_exp3:
