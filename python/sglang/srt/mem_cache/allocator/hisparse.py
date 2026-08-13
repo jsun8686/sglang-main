@@ -9,7 +9,17 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import get_num_new_pages, is_npu
+
+
+def _get_paged_allocator_cls():
+    if is_npu():
+        from sglang.srt.hardware_backend.npu.allocator_npu import (
+            NPUPagedTokenToKVPoolAllocator,
+        )
+
+        return NPUPagedTokenToKVPoolAllocator
+    return PagedTokenToKVPoolAllocator
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -32,7 +42,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.page_size = page_size
         self.need_sort = need_sort
 
-        self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
+        AllocatorCls = _get_paged_allocator_cls()
+
+        self.logical_attn_allocator = AllocatorCls(
             self._size_full,
             self.page_size,
             self.dtype,
@@ -40,7 +52,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
+        self.hisparse_attn_allocator = AllocatorCls(
             self._size_hisparse,
             self.page_size,
             self.dtype,
