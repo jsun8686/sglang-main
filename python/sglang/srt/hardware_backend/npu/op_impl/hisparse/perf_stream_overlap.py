@@ -798,18 +798,20 @@ def _calibrate_workload(
     return results
 
 
-def _make_matmul_factory(reps_key=1):
+def _make_matmul_factory():
     """Factory that creates a matmul workload from (N, repeats) config."""
     def factory(device, cfg):
         n, reps = cfg
-        mat_a = torch.randn(n, n, dtype=torch.float16, device=device)
-        mat_b = torch.randn(n, n, dtype=torch.float16, device=device)
-        mat_c = torch.empty_like(mat_a)
+        st = dict(
+            a=torch.randn(n, n, dtype=torch.float16, device=device),
+            b=torch.randn(n, n, dtype=torch.float16, device=device),
+            c=torch.empty(n, n, dtype=torch.float16, device=device),
+        )
         def workload():
             for _ in range(reps):
-                torch.matmul(mat_a, mat_b, out=mat_c)
+                torch.matmul(st["a"], st["b"], out=st["c"])
         def cleanup():
-            del mat_a, mat_b, mat_c
+            st.clear()
             torch.npu.empty_cache()
         return workload, cleanup
     return factory
@@ -823,27 +825,18 @@ def _make_sdpa_factory():
         head_dim = 128
         batch = NUM_REQS
         # Decode pattern: 1 query token, kv_len KV tokens
-        q = torch.randn(1, num_heads, batch, head_dim, dtype=torch.float16, device=device)
-        k = torch.randn(1, num_heads, kv_len, head_dim, dtype=torch.float16, device=device)
-        v = torch.randn(1, num_heads, kv_len, head_dim, dtype=torch.float16, device=device)
-        # Repeat K, V across batch dimension (each request attends to its own KV)
-        k_expanded = k.expand(1, num_heads, batch, kv_len).contiguous() if batch > 1 else k
-        v_expanded = v.expand(1, num_heads, batch, kv_len).contiguous() if batch > 1 else v
-        # Reshape for sdpa: [batch * num_heads, 1, head_dim] is not needed;
-        # sdpa accepts [batch, heads, seq, dim]
-        q_sdpa = q.transpose(0, 2).transpose(1, 2)  # [batch, 1, num_heads, head_dim]
-        k_sdpa = k_expanded.transpose(0, 2).transpose(1, 2)  # [batch, kv_len, num_heads, head_dim]
-        v_sdpa = v_expanded.transpose(0, 2).transpose(1, 2)
-        # Actually sdpa wants [batch, heads, q_len, head_dim]
-        q_sdpa = q_sdpa.transpose(1, 2)  # [batch, num_heads, 1, head_dim]
-        k_sdpa = k_sdpa.transpose(1, 2)  # [batch, num_heads, kv_len, head_dim]
-        v_sdpa = v_sdpa.transpose(1, 2)
+        # sdpa shape: [batch, heads, seq, head_dim]
+        st = dict(
+            q=torch.randn(batch, num_heads, 1, head_dim, dtype=torch.float16, device=device),
+            k=torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device),
+            v=torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device),
+        )
         from torch.nn.functional import scaled_dot_product_attention as sdpa
         def workload():
             for _ in range(reps):
-                sdpa(q_sdpa, k_sdpa, v_sdpa)
+                sdpa(st["q"], st["k"], st["v"])
         def cleanup():
-            del q, k, v, k_expanded, v_expanded, q_sdpa, k_sdpa, v_sdpa
+            st.clear()
             torch.npu.empty_cache()
         return workload, cleanup
     return factory
@@ -856,17 +849,19 @@ def _make_matmul_softmax_factory():
         num_heads = 16
         head_dim = 128
         batch = NUM_REQS
-        q = torch.randn(batch, num_heads, 1, head_dim, dtype=torch.float16, device=device)
-        k = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device)
-        v = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device)
+        st = dict(
+            q=torch.randn(batch, num_heads, 1, head_dim, dtype=torch.float16, device=device),
+            k=torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device),
+            v=torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device),
+        )
         scale = head_dim ** -0.5
         def workload():
             for _ in range(reps):
-                scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+                scores = torch.matmul(st["q"], st["k"].transpose(-2, -1)) * scale
                 attn = torch.softmax(scores, dim=-1)
-                torch.matmul(attn, v)
+                torch.matmul(attn, st["v"])
         def cleanup():
-            del q, k, v
+            st.clear()
             torch.npu.empty_cache()
         return workload, cleanup
     return factory
