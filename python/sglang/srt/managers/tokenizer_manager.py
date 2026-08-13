@@ -2123,7 +2123,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
             if obj.is_single:
                 self.abort_request(obj.rid, force=True)
             else:

@@ -226,11 +226,16 @@ def _init_tokens(state: Dict[str, torch.Tensor], device_buffer_size: int) -> Non
 def _pre_populate_for_scatter(state: Dict[str, torch.Tensor],
                               num_reqs: int, top_k: int,
                               device_buffer_size: int) -> None:
-    """Set is_miss=1 and top_k_device_slots to valid slots so scatter has work."""
+    """Set is_miss=1, top_k_device_slots to valid slots, and topk_indices to
+    random token positions so scatter reads diverse host addresses."""
     state["is_miss"].fill_(1)
     slots = torch.arange(top_k, dtype=torch.int32, device=state["top_k_device_slots"].device)
     slots = slots % device_buffer_size
     state["top_k_device_slots"][:, :] = slots.unsqueeze(0).expand(num_reqs, top_k)
+    state["topk_indices"].copy_(
+        _gen_topk(state["topk_indices"].device, num_reqs, top_k,
+                  device_buffer_size, miss_ratio=0.0)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -593,10 +598,13 @@ def main():
 
         print(f"\nAuto block_dim = {hisparse_pkg._resolve_block_dim(0)}")
 
-        # Allocate pinned host cache
+        # Allocate pinned host cache — must cover all layer_ids used by
+        # scatter (layer 0 for state_a, layer 1 for state_b).
+        # Kernel addresses: host_kv + (layer_id * host_entries + offset) * row_bytes
         kv_row_bytes = K_ROW_BYTES + V_ROW_BYTES
+        HOST_LAYERS = 2  # layer_id 0 and 1
         host_kv_ptr, host_kv_dev_ptr, host_kv_size = \
-            _acl_malloc_host(MAX_CONTEXT_LEN * kv_row_bytes)
+            _acl_malloc_host(HOST_LAYERS * MAX_CONTEXT_LEN * kv_row_bytes)
 
         try:
             # Two independent state sets
