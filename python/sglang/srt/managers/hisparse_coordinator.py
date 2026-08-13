@@ -1449,6 +1449,15 @@ class HiSparseCoordinator:
 
     def _abort_staging_request_npu(self, req: Req) -> None:
         self._free_device_buffer_npu(req.req_pool_idx)
+
+        prefill_len = req.extend_range.end
+        allocated_locs = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :prefill_len
+        ]
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            allocated_locs.to(torch.int64)
+        ] = 0
+
         host_allocated_len = int(self.req_host_allocated_len[req.req_pool_idx].item())
         host_indices = self.req_to_host_pool[req.req_pool_idx, :host_allocated_len]
         host_indices = host_indices[host_indices >= 0]

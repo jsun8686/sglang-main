@@ -1,3 +1,4 @@
+import os
 import weakref
 
 import torch
@@ -75,6 +76,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._ordered_free = (
+            os.environ.get("SGLANG_HISPARSE_ORDERED_DEVICE_POOL", "1") == "1"
+        )
         self.clear()
         self._kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
@@ -213,6 +217,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # disable free group mechanism for device buffer free
         self.hisparse_attn_allocator.is_not_in_free_group = True
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        if self._ordered_free:
+            fp = self.hisparse_attn_allocator.free_pages
+            if fp is not None and fp.numel() > 1:
+                self.hisparse_attn_allocator.free_pages = fp.sort().values
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
