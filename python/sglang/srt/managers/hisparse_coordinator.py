@@ -1469,7 +1469,7 @@ class HiSparseCoordinator:
         self._free_device_buffer_npu(req.req_pool_idx)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.extend_range.end
+            req.req_pool_idx, : req.kv.kv_allocated_len
         ]
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             allocated_locs.to(torch.int64)
