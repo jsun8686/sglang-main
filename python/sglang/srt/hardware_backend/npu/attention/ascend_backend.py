@@ -301,6 +301,7 @@ class AscendAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
+        self.model_runner = model_runner
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
         self.speculative_step_offset_npu = torch.tensor(
