@@ -1225,7 +1225,26 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
 
-        token_to_kv_pool = NPUMLATokenToKVPool(
+        pool_kwargs = {}
+        PoolCls = NPUMLATokenToKVPool
+        if get_memory().enable_hisparse and is_dsa_model:
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUHiSparseTokenToKVPool,
+            )
+
+            PoolCls = NPUHiSparseTokenToKVPool
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
+                self.server_args
+            ).host_to_device_ratio
+            pool_kwargs["kv_cache_dim"] = calculate_mla_kv_cache_dim(
+                model_config=self.model_config,
+                kv_cache_dtype=self.kv_cache_dtype,
+                server_args=self.server_args,
+            )
+
+        token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
@@ -1237,6 +1256,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            **pool_kwargs,
         )
         return token_to_kv_pool
 
@@ -1601,18 +1621,34 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 else:
-                    from sglang.srt.hardware_backend.npu.allocator_npu import (
-                        NPUPagedTokenToKVPoolAllocator,
-                    )
+                    if get_memory().enable_hisparse:
+                        from sglang.srt.mem_cache.sparsity import (
+                            parse_hisparse_config,
+                        )
 
-                    token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                        hisparse_cfg = parse_hisparse_config(self.server_args)
+                        token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
+                            sizes.max_total_num_tokens,
+                            page_size=get_schedule().page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                        )
+                    else:
+                        from sglang.srt.hardware_backend.npu.allocator_npu import (
+                            NPUPagedTokenToKVPoolAllocator,
+                        )
+
+                        token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
+                            sizes.max_total_num_tokens,
+                            page_size=get_schedule().page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
             else:
                 if self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
                     token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
