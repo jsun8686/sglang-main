@@ -1051,9 +1051,10 @@ def run_experiment_4(
         print(f"  ====== Mode: {mode_name} ======\n")
         mode_results = []
 
-        for cfg in calibrated[mode_name]:
+        for cal_entry in calibrated[mode_name]:
+            cfg = cal_entry[:-1]
+            T_attn_solo = cal_entry[-1]
             workload, cleanup = factory(device, cfg)
-            T_attn_solo = cfg[-1]
 
             # Serial baseline
             def run_serial(_workload=workload):
