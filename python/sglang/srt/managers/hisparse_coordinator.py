@@ -1364,18 +1364,19 @@ class HiSparseCoordinator:
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
     def _alloc_device_buffer_npu(self, req: Req) -> None:
+        kv_len = req.extend_range.end
         allocated_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.kv_allocated_len
+            req.req_pool_idx, :kv_len
         ]
         page_size = self.mem_pool_device.page_size
         alloc_size = min(
-            ((req.kv_allocated_len + page_size - 1) // page_size) * page_size,
+            ((kv_len + page_size - 1) // page_size) * page_size,
             self.device_buffer_size,
         )
         if alloc_size == self.device_buffer_size:
             alloc_size = self.padded_buffer_size
         head_keep = tail_keep = 0
-        if req.kv_allocated_len >= self.device_buffer_size:
+        if kv_len >= self.device_buffer_size:
             head_keep = (self.device_buffer_size // (2 * page_size)) * page_size
             tail_keep = self.device_buffer_size - head_keep
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
@@ -1403,8 +1404,8 @@ class HiSparseCoordinator:
                 head_keep, dtype=torch.int32, device=self.device
             )
             init_tokens[:, head_keep : head_keep + tail_keep] = torch.arange(
-                req.kv_allocated_len - tail_keep,
-                req.kv_allocated_len,
+                kv_len - tail_keep,
+                kv_len,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -1468,7 +1469,7 @@ class HiSparseCoordinator:
         self._free_device_buffer_npu(req.req_pool_idx)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.kv_allocated_len
+            req.req_pool_idx, : req.extend_range.end
         ]
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             allocated_locs.to(torch.int64)
