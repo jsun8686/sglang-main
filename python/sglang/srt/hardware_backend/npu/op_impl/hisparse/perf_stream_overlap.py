@@ -35,6 +35,11 @@ hardware-level cross-stream parallelism (DMA vs compute overlap):
           Phase 1 (anchor) always block_dim=48; sweep side-stream scatter
           block_dim to find optimal AIV core partition (910B = 24 AIC + 48 AIV).
 
+  Exp 5: Full transformer pipeline (attention + MoE交替).
+         Main stream alternates attn(AIV) + MoE(AIC) per layer.
+         Tests whether AIC-only MoE phases create AIV-free windows that
+         allow side-stream scatter to proceed with low contention.
+
 Usage on NPU host:
   # Exp 0 only (no kernel build needed):
   python perf_stream_overlap.py --exp 0
@@ -1525,6 +1530,283 @@ def run_experiment_4b(
 
 
 # ===========================================================================
+# Experiment 5: Full transformer layer pipeline (attention + MoE交替)
+# ===========================================================================
+#
+# Exp 4b showed sdpa(48 AIV) vs scatter(48 AIV) = +44% contention because
+# both compete for the same AIV cores' MTE pipeline.
+# Exp 2c showed AIC(matmul) vs AIV(scatter) = +23% overlap — different
+# core types can parallelize.
+#
+# In production, each layer group (1 anchor + 3 shared) processes 4 transformer
+# layers, each containing attention (AIV-heavy) + MLP/MoE (AIC-heavy).
+# The AIC-only MoE phases create windows where AIV is free for scatter.
+#
+# Production timeline:
+#   Main:  |sieve+sc|== attn1(AIV) ==|== moe1(AIC) ==|== attn2(AIV) ==|== moe2(AIC) ==|...
+#   Side:            |============== 3× scatter (AIV) ===============|
+#                    ↑ contention during attn    ↑ free during moe ↑
+#
+# This experiment simulates that交替 pattern and measures whether the MoE
+# phases provide enough AIV-free windows for scatter to complete with low
+# contention.
+
+# Each config: (kv_len, matmul_n, matmul_reps_per_layer, num_layers)
+# - kv_len: attention KV length
+# - matmul_n × reps: simulates MoE expert matmul (AIC-only)
+# - num_layers: number of attn+MoE pairs per group (default 4 = index_topk_freq)
+TRANSFORMER_CONFIGS = [
+    # (kv_len, moe_matmul_n, moe_reps, num_layers)
+    (2048, 2048,  5, 4),   # light MoE
+    (2048, 4096,  5, 4),   # medium MoE
+    (2048, 4096, 10, 4),   # heavy MoE
+    (2048, 2048,  5, 8),   # double layers (more AIV-free windows)
+]
+
+
+def run_experiment_5(
+    device: str,
+    state_anchor: Dict[str, torch.Tensor],
+    shared_states: List[Dict[str, torch.Tensor]],
+    host_kv_dev_ptr: int,
+    num_shared: int,
+) -> None:
+    print("=" * 72)
+    print("Experiment 5: Full transformer pipeline (attention + MoE交替)")
+    print(f"  Simulates {num_shared+1}-layer group: alternating attn(AIV) + MoE(AIC)")
+    print(f"  Side stream: {num_shared}× scatter (AIV)")
+    print(f"  Hypothesis: MoE phases free AIV for scatter → lower contention")
+    print("=" * 72)
+
+    from sglang.srt.hardware_backend.npu.op_impl.hisparse import (
+        sieve_update_npu,
+        scatter_from_host_npu,
+    )
+    from torch.nn.functional import scaled_dot_product_attention as sdpa
+
+    PHASE1_BD = 48
+    SIDE_BD = 48
+
+    # --- Prepare states ---
+    state_anchor["topk_indices"].copy_(
+        _gen_topk(device, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE, MISS_RATIO)
+    )
+    _init_tokens(state_anchor, DEVICE_BUFFER_SIZE)
+    for ss in shared_states[:num_shared]:
+        _pre_populate_for_scatter(ss, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
+
+    # --- Helper: Phase 1 anchor swap-in ---
+    def _run_phase1():
+        sieve_update_npu(
+            layer_id=0,
+            topk_indices=state_anchor["topk_indices"],
+            req_pool_indices=state_anchor["req_pool_indices"],
+            seq_lens=state_anchor["seq_lens"],
+            prefill_len=state_anchor["prefill_len"],
+            device_buffer_tokens=state_anchor["device_buffer_tokens"],
+            device_buffer_visited=state_anchor["device_buffer_visited"],
+            device_buffer_ht=state_anchor["device_buffer_ht"][0],
+            sieve_hand=state_anchor["sieve_hand"],
+            top_k_device_slots=state_anchor["top_k_device_slots"],
+            is_miss=state_anchor["is_miss"],
+            num_real_reqs=state_anchor["num_real_reqs"],
+            top_k=TOP_K,
+            device_buffer_size=DEVICE_BUFFER_SIZE,
+            padded_buffer_size=PADDED_BUFFER_SIZE,
+            max_num_reqs=NUM_REQS,
+            block_dim=PHASE1_BD,
+        )
+        scatter_from_host_npu(
+            host_kv_cache_ptr=host_kv_dev_ptr,
+            topk_indices=state_anchor["topk_indices"],
+            top_k_device_slots=state_anchor["top_k_device_slots"],
+            is_miss=state_anchor["is_miss"],
+            req_pool_indices=state_anchor["req_pool_indices"],
+            req_to_host_pool=state_anchor["req_to_host_pool"],
+            req_to_device_buffer=state_anchor["req_to_device_buffer"],
+            device_k_buffer=state_anchor["device_k_buffer"],
+            device_v_buffer=state_anchor["device_v_buffer"],
+            layer_id=0,
+            host_entries=MAX_CONTEXT_LEN,
+            k_row_bytes=K_ROW_BYTES,
+            v_row_bytes=V_ROW_BYTES,
+            max_context_len=MAX_CONTEXT_LEN,
+            device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+            padded_buffer_size=PADDED_BUFFER_SIZE,
+            max_num_reqs=NUM_REQS,
+            top_k=TOP_K,
+            block_dim=PHASE1_BD,
+        )
+
+    # --- Helper: side-stream scatters ---
+    def _run_side():
+        for idx in range(num_shared):
+            ss = shared_states[idx]
+            scatter_from_host_npu(
+                host_kv_cache_ptr=host_kv_dev_ptr,
+                topk_indices=ss["topk_indices"],
+                top_k_device_slots=ss["top_k_device_slots"],
+                is_miss=ss["is_miss"],
+                req_pool_indices=ss["req_pool_indices"],
+                req_to_host_pool=ss["req_to_host_pool"],
+                req_to_device_buffer=ss["req_to_device_buffer"],
+                device_k_buffer=ss["device_k_buffer"],
+                device_v_buffer=ss["device_v_buffer"],
+                layer_id=1 + idx,
+                host_entries=MAX_CONTEXT_LEN,
+                k_row_bytes=K_ROW_BYTES,
+                v_row_bytes=V_ROW_BYTES,
+                max_context_len=MAX_CONTEXT_LEN,
+                device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+                padded_buffer_size=PADDED_BUFFER_SIZE,
+                max_num_reqs=NUM_REQS,
+                top_k=TOP_K,
+                block_dim=SIDE_BD,
+            )
+
+    # --- Measure baselines ---
+    print("\n  --- Step 1: Baseline timings ---\n")
+
+    times_p1 = []
+    for i in range(WARMUP + ITERS):
+        ev0 = torch.npu.Event(enable_timing=True)
+        ev1 = torch.npu.Event(enable_timing=True)
+        ev0.record(); _run_phase1(); ev1.record()
+        torch.npu.synchronize()
+        if i >= WARMUP:
+            times_p1.append(ev0.elapsed_time(ev1))
+    T_phase1 = _median(times_p1)
+
+    times_side = []
+    for i in range(WARMUP + ITERS):
+        ev0 = torch.npu.Event(enable_timing=True)
+        ev1 = torch.npu.Event(enable_timing=True)
+        ev0.record(); _run_side(); ev1.record()
+        torch.npu.synchronize()
+        if i >= WARMUP:
+            times_side.append(ev0.elapsed_time(ev1))
+    T_side_solo = _median(times_side)
+
+    print(f"    T_phase1 (sieve+scatter bd=48) = {T_phase1:8.3f} ms")
+    print(f"    T_side ({num_shared}× scatter bd=48)    = {T_side_solo:8.3f} ms")
+
+    # --- Sweep transformer configs ---
+    print("\n  --- Step 2: Transformer pipeline sweep ---\n")
+    side_stream = torch.npu.Stream()
+    results = []
+
+    for kv_len, moe_n, moe_reps, num_layers in TRANSFORMER_CONFIGS:
+        num_heads = 16
+        head_dim = 128
+        batch = NUM_REQS
+        attn_st = dict(
+            q=torch.randn(batch, num_heads, 1, head_dim, dtype=torch.float16, device=device),
+            k=torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device),
+            v=torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device),
+        )
+        moe_a = torch.randn(moe_n, moe_n, dtype=torch.float16, device=device)
+        moe_b = torch.randn(moe_n, moe_n, dtype=torch.float16, device=device)
+        moe_c = torch.empty_like(moe_a)
+
+        def _run_transformer():
+            """num_layers pairs of attn(sdpa, AIV) + MoE(matmul, AIC)."""
+            for _ in range(num_layers):
+                # Attention phase — AIV heavy
+                sdpa(attn_st["q"], attn_st["k"], attn_st["v"])
+                # MoE phase — AIC only (frees AIV)
+                for _ in range(moe_reps):
+                    torch.matmul(moe_a, moe_b, out=moe_c)
+
+        # Measure T_main_solo (transformer only, no side stream)
+        times_main = []
+        for i in range(WARMUP + ITERS):
+            ev0 = torch.npu.Event(enable_timing=True)
+            ev1 = torch.npu.Event(enable_timing=True)
+            ev0.record(); _run_transformer(); ev1.record()
+            torch.npu.synchronize()
+            if i >= WARMUP:
+                times_main.append(ev0.elapsed_time(ev1))
+        T_main_solo = _median(times_main)
+
+        # Serial baseline: phase1 + transformer + side (all serial)
+        times_serial = []
+        for i in range(WARMUP + ITERS):
+            ev0 = torch.npu.Event(enable_timing=True)
+            ev1 = torch.npu.Event(enable_timing=True)
+            ev0.record()
+            _run_phase1()
+            _run_transformer()
+            _run_side()
+            ev1.record()
+            torch.npu.synchronize()
+            if i >= WARMUP:
+                times_serial.append(ev0.elapsed_time(ev1))
+        T_serial = _median(times_serial)
+
+        # Production: phase1 → fork → transformer(main) || side_scatters(side)
+        times_prod = []
+        for i in range(WARMUP + ITERS):
+            ev0 = torch.npu.Event(enable_timing=True)
+            ev1 = torch.npu.Event(enable_timing=True)
+            ev0.record()
+            _run_phase1()
+            side_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(side_stream):
+                _run_side()
+            _run_transformer()
+            torch.npu.current_stream().wait_stream(side_stream)
+            ev1.record()
+            torch.npu.synchronize()
+            if i >= WARMUP:
+                times_prod.append(ev0.elapsed_time(ev1))
+        T_prod = _median(times_prod)
+
+        speedup = T_serial / T_prod if T_prod > 0 else 0
+        T_ideal = T_phase1 + max(T_main_solo, T_side_solo)
+        contention = (T_prod - T_ideal) / T_ideal * 100 if T_ideal > 0 else 0
+        coverage = min(1.0, T_main_solo / T_side_solo) if T_side_solo > 0 else 1.0
+
+        label = f"kv={kv_len} moe=mm({moe_n})x{moe_reps} layers={num_layers}"
+        print(f"  [{label}]")
+        print(f"    T_main(transformer) = {T_main_solo:7.2f} ms  "
+              f"(attn+AIC mix)")
+        print(f"    T_side({num_shared}×scatter)  = {T_side_solo:7.2f} ms")
+        print(f"    serial   = {T_serial:7.2f} ms")
+        print(f"    prod     = {T_prod:7.2f} ms")
+        print(f"    speedup={speedup:.2f}x  contention={contention:+.1f}%  "
+              f"coverage={coverage*100:.0f}%")
+        print()
+
+        results.append((kv_len, moe_n, moe_reps, num_layers,
+                        T_main_solo, T_serial, T_prod, speedup,
+                        contention, coverage))
+
+        del attn_st, moe_a, moe_b, moe_c
+        torch.npu.empty_cache()
+
+    # --- Summary table ---
+    best = max(results, key=lambda r: r[7])
+    print(f"  ╔════════════════════════════════════════════════════════════════════════════════╗")
+    print(f"  ║ Experiment 5: Full transformer pipeline                                      ║")
+    print(f"  ║ T_phase1={T_phase1:.1f}ms  T_side={T_side_solo:.1f}ms  side_bd={SIDE_BD}                              ║")
+    print(f"  ╠══════════════════════════════╦══════════╦══════════╦══════════╦══════════════╣")
+    print(f"  ║ config                       ║ T_main   ║ T_prod   ║ speedup  ║ contention   ║")
+    print(f"  ╠══════════════════════════════╬══════════╬══════════╬══════════╬══════════════╣")
+    for kv, mn, mr, nl, tm, ts, tp, sp, cont, cov in results:
+        tag = " <<<" if tp == best[6] else ""
+        print(f"  ║ kv={kv} moe=mm({mn})x{mr:<2d} L={nl}     "
+              f"║ {tm:8.2f} ║ {tp:8.2f} ║ {sp:7.2f}x ║ {cont:+10.1f}%  ║{tag}")
+    print(f"  ╚══════════════════════════════╩══════════╩══════════╩══════════╩══════════════╝")
+    print()
+    print(f"  Best: speedup={best[7]:.2f}x (T_prod={best[6]:.2f}ms "
+          f"vs serial={best[5]:.2f}ms, contention={best[8]:+.1f}%)")
+    print()
+    print("  Compare to Exp 4b: sdpa-only (no MoE) had contention +44%.")
+    print("  If MoE交替 lowers contention significantly, the AIV-free-window")
+    print("  hypothesis is confirmed.")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -1536,7 +1818,7 @@ def main():
     )
     parser.add_argument(
         "--exp", type=str, default="0",
-        choices=["0", "1", "2", "2c", "3", "4", "4b", "all"],
+        choices=["0", "1", "2", "2c", "3", "4", "4b", "5", "all"],
         help="Which experiment to run (default: 0)",
     )
     parser.add_argument(
@@ -1578,14 +1860,15 @@ def main():
     run_exp3 = args.exp in ("3", "all")
     run_exp4 = args.exp in ("4", "all")
     run_exp4b = args.exp in ("4b", "all")
+    run_exp5 = args.exp in ("5", "all")
     num_shared = args.num_shared
 
     # --- Experiment 0 ---
     if run_exp0:
         run_experiment_0(device)
 
-    # --- Experiments 1, 2, 2c, 3, 4, 4b (require kernel build) ---
-    if run_exp1 or run_exp2 or run_exp2c or run_exp3 or run_exp4 or run_exp4b:
+    # --- Experiments 1, 2, 2c, 3, 4, 4b, 5 (require kernel build) ---
+    if run_exp1 or run_exp2 or run_exp2c or run_exp3 or run_exp4 or run_exp4b or run_exp5:
         from sglang.srt.hardware_backend.npu.op_impl import hisparse as hisparse_pkg
         if not hisparse_pkg._HAS_KERNEL:
             print("\nERROR: hisparse_lru native extension not built.")
@@ -1646,6 +1929,17 @@ def main():
                     for _ in range(num_shared)
                 ]
                 run_experiment_4b(
+                    device, state_a, shared_states, host_kv_dev_ptr,
+                    num_shared=num_shared,
+                )
+                del shared_states
+
+            if run_exp5:
+                shared_states = [
+                    _make_state(device, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
+                    for _ in range(num_shared)
+                ]
+                run_experiment_5(
                     device, state_a, shared_states, host_kv_dev_ptr,
                     num_shared=num_shared,
                 )
