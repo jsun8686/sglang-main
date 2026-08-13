@@ -18,10 +18,13 @@ hardware-level cross-stream parallelism (DMA vs compute overlap):
          Finds optimal core split for plan-then-IO overlap.
 
   Exp 4: Production pipeline simulation.
-         Main stream: sieve+scatter(anchor) → matmul (attention proxy).
+         Main stream: sieve+scatter(anchor) → attention (proxy) on main.
          Side stream: N× serial scatter (shared layers).
          Tests whether side-stream scatters are fully covered by main-stream
-         attention computation.
+         attention computation.  Three attention proxy modes are compared:
+           - matmul:        Cube only (AIC) — no DMA contention baseline
+           - matmul_softmax: Cube + Vector — adds softmax pipeline
+           - sdpa:          Cube + Vector + MTE — real attention DMA contention
 
 Usage on NPU host:
   # Exp 0 only (no kernel build needed):
@@ -735,10 +738,23 @@ def _print_summary_table(title: str, results: List[Tuple]) -> None:
 # ===========================================================================
 # Experiment 4: Production pipeline simulation
 # ===========================================================================
+#
+# Three attention proxy modes to quantify DMA bandwidth contention:
+#
+#   "matmul":  pure torch.matmul — Cube only (AIC).
+#              Baseline: no DMA contention from attention on scatter.
+#
+#   "matmul_softmax": manual QK^T → softmax → PV — Cube + Vector.
+#              Adds Vector (softmax) but still light MTE.
+#
+#   "sdpa":    scaled_dot_product_attention — full Cube + Vector + MTE.
+#              NPU maps this to fused flash attention, which reads KV from GM
+#              (MTE2 heavy) → directly competes with scatter for DMA bandwidth.
+#
+# Comparing matmul vs sdpa overlap reveals how much DMA contention costs.
 
-# Matmul sizes to sweep as attention proxy.  Each entry is (matrix_N, repeats).
-# Larger N or more repeats → longer attention phase → more side-stream coverage.
-ATTENTION_CONFIGS = [
+# Matmul sizes to sweep: (matrix_N, repeats)
+MATMUL_CONFIGS = [
     (2048,  20),
     (4096,  20),
     (4096,  50),
@@ -746,34 +762,114 @@ ATTENTION_CONFIGS = [
     (8192, 100),
 ]
 
+# SDPA configs: (kv_len, repeats).  Decode pattern: Q=[1, heads, 128, d], K=V=[1, heads, kv_len, d]
+# head_dim=128, num_heads=16, batch=128 (=NUM_REQS).
+SDPA_CONFIGS = [
+    (256,  4),
+    (512,  4),
+    (1024, 4),
+    (2048, 4),
+    (4096, 4),
+]
 
-def _calibrate_matmul(
+
+def _calibrate_workload(
     device: str,
-    configs: List[Tuple[int, int]],
-) -> List[Tuple[int, int, float]]:
-    """Measure solo matmul time for each config; return [(N, repeats, ms), ...]."""
+    fn_factory: Callable,
+    configs: list,
+) -> List[Tuple]:
+    """Generic calibration: for each config, measure solo workload time."""
     results = []
-    for n, reps in configs:
-        mat_a = torch.randn(n, n, dtype=torch.float16, device=device)
-        mat_b = torch.randn(n, n, dtype=torch.float16, device=device)
-        mat_c = torch.empty_like(mat_a)
-
+    for cfg in configs:
+        workload, cleanup = fn_factory(device, cfg)
         times = []
         for i in range(WARMUP + ITERS):
             ev0 = torch.npu.Event(enable_timing=True)
             ev1 = torch.npu.Event(enable_timing=True)
             ev0.record()
-            for _ in range(reps):
-                torch.matmul(mat_a, mat_b, out=mat_c)
+            workload()
             ev1.record()
             torch.npu.synchronize()
             if i >= WARMUP:
                 times.append(ev0.elapsed_time(ev1))
         ms = _median(times)
-        results.append((n, reps, ms))
-        del mat_a, mat_b, mat_c
-        torch.npu.empty_cache()
+        results.append((*cfg, ms))
+        cleanup()
     return results
+
+
+def _make_matmul_factory(reps_key=1):
+    """Factory that creates a matmul workload from (N, repeats) config."""
+    def factory(device, cfg):
+        n, reps = cfg
+        mat_a = torch.randn(n, n, dtype=torch.float16, device=device)
+        mat_b = torch.randn(n, n, dtype=torch.float16, device=device)
+        mat_c = torch.empty_like(mat_a)
+        def workload():
+            for _ in range(reps):
+                torch.matmul(mat_a, mat_b, out=mat_c)
+        def cleanup():
+            del mat_a, mat_b, mat_c
+            torch.npu.empty_cache()
+        return workload, cleanup
+    return factory
+
+
+def _make_sdpa_factory():
+    """Factory for scaled_dot_product_attention workload from (kv_len, reps) config."""
+    def factory(device, cfg):
+        kv_len, reps = cfg
+        num_heads = 16
+        head_dim = 128
+        batch = NUM_REQS
+        # Decode pattern: 1 query token, kv_len KV tokens
+        q = torch.randn(1, num_heads, batch, head_dim, dtype=torch.float16, device=device)
+        k = torch.randn(1, num_heads, kv_len, head_dim, dtype=torch.float16, device=device)
+        v = torch.randn(1, num_heads, kv_len, head_dim, dtype=torch.float16, device=device)
+        # Repeat K, V across batch dimension (each request attends to its own KV)
+        k_expanded = k.expand(1, num_heads, batch, kv_len).contiguous() if batch > 1 else k
+        v_expanded = v.expand(1, num_heads, batch, kv_len).contiguous() if batch > 1 else v
+        # Reshape for sdpa: [batch * num_heads, 1, head_dim] is not needed;
+        # sdpa accepts [batch, heads, seq, dim]
+        q_sdpa = q.transpose(0, 2).transpose(1, 2)  # [batch, 1, num_heads, head_dim]
+        k_sdpa = k_expanded.transpose(0, 2).transpose(1, 2)  # [batch, kv_len, num_heads, head_dim]
+        v_sdpa = v_expanded.transpose(0, 2).transpose(1, 2)
+        # Actually sdpa wants [batch, heads, q_len, head_dim]
+        q_sdpa = q_sdpa.transpose(1, 2)  # [batch, num_heads, 1, head_dim]
+        k_sdpa = k_sdpa.transpose(1, 2)  # [batch, num_heads, kv_len, head_dim]
+        v_sdpa = v_sdpa.transpose(1, 2)
+        from torch.nn.functional import scaled_dot_product_attention as sdpa
+        def workload():
+            for _ in range(reps):
+                sdpa(q_sdpa, k_sdpa, v_sdpa)
+        def cleanup():
+            del q, k, v, k_expanded, v_expanded, q_sdpa, k_sdpa, v_sdpa
+            torch.npu.empty_cache()
+        return workload, cleanup
+    return factory
+
+
+def _make_matmul_softmax_factory():
+    """Factory for manual matmul(Q,K^T)→softmax→matmul(P,V) workload."""
+    def factory(device, cfg):
+        kv_len, reps = cfg
+        num_heads = 16
+        head_dim = 128
+        batch = NUM_REQS
+        q = torch.randn(batch, num_heads, 1, head_dim, dtype=torch.float16, device=device)
+        k = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device)
+        v = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float16, device=device)
+        scale = head_dim ** -0.5
+        def workload():
+            for _ in range(reps):
+                scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+                attn = torch.softmax(scores, dim=-1)
+                torch.matmul(attn, v)
+        def cleanup():
+            del q, k, v
+            torch.npu.empty_cache()
+        return workload, cleanup
+    return factory
 
 
 def run_experiment_4(
@@ -785,24 +881,25 @@ def run_experiment_4(
     block_dim: int = 48,
 ) -> None:
     """
-    Production pipeline simulation:
+    Production pipeline simulation with realistic attention proxies.
 
       Phase 1 (serial on main):
         Main:  |== sieve(anchor) ==|== scatter(anchor) ==|
         Side:  (idle)
 
       Phase 2 (parallel, fork after Phase 1):
-        Main:  |== matmul ×N (attention) ====================|
+        Main:  |== attention ×N (proxy) ===================|
         Side:  |== scatter(sh1) ==|== scatter(sh2) ==|== ... ==|
 
-    Measures whether the side-stream scatters are fully covered by the
-    main-stream attention computation.
+    Runs three attention proxy modes and compares their overlap to quantify
+    DMA bandwidth contention between attention and scatter.
     """
     print("=" * 72)
     print(f"Experiment 4: Production pipeline simulation")
     print(f"  1 anchor + {num_shared} shared layers (index_topk_freq={num_shared + 1})")
     print(f"  Phase 1: sieve+scatter(anchor) on main stream")
-    print(f"  Phase 2: matmul (attention proxy) on main  ||  {num_shared}× scatter on side")
+    print(f"  Phase 2: attention (proxy) on main  ||  {num_shared}× scatter on side")
+    print(f"  Modes: matmul(Cube) | matmul+softmax(Cube+Vec) | sdpa(Cube+Vec+MTE)")
     print("=" * 72)
 
     from sglang.srt.hardware_backend.npu.op_impl.hisparse import (
@@ -821,16 +918,9 @@ def run_experiment_4(
         _pre_populate_for_scatter(ss, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
 
     # ==================================================================
-    # Step 1: Measure Phase 1 components (all serial on main stream)
+    # Helper: run anchor sieve+scatter on a given stream context
     # ==================================================================
-    print("\n  --- Step 1: Phase 1 timing (serial) ---\n")
-
-    # T_sieve
-    times_sieve = []
-    for i in range(WARMUP + ITERS):
-        ev0 = torch.npu.Event(enable_timing=True)
-        ev1 = torch.npu.Event(enable_timing=True)
-        ev0.record()
+    def _run_anchor_swap_in():
         sieve_update_npu(
             layer_id=0,
             topk_indices=state_anchor["topk_indices"],
@@ -850,18 +940,6 @@ def run_experiment_4(
             max_num_reqs=NUM_REQS,
             block_dim=block_dim,
         )
-        ev1.record()
-        torch.npu.synchronize()
-        if i >= WARMUP:
-            times_sieve.append(ev0.elapsed_time(ev1))
-    T_sieve = _median(times_sieve)
-
-    # T_scatter_anchor
-    times_scatter_a = []
-    for i in range(WARMUP + ITERS):
-        ev0 = torch.npu.Event(enable_timing=True)
-        ev1 = torch.npu.Event(enable_timing=True)
-        ev0.record()
         scatter_from_host_npu(
             host_kv_cache_ptr=host_kv_dev_ptr,
             topk_indices=state_anchor["topk_indices"],
@@ -883,23 +961,8 @@ def run_experiment_4(
             top_k=TOP_K,
             block_dim=block_dim,
         )
-        ev1.record()
-        torch.npu.synchronize()
-        if i >= WARMUP:
-            times_scatter_a.append(ev0.elapsed_time(ev1))
-    T_scatter_anchor = _median(times_scatter_a)
 
-    T_phase1 = T_sieve + T_scatter_anchor
-    print(f"    T_sieve(anchor)     = {T_sieve:8.3f} ms")
-    print(f"    T_scatter(anchor)   = {T_scatter_anchor:8.3f} ms")
-    print(f"    T_phase1 (sum)      = {T_phase1:8.3f} ms")
-
-    # ==================================================================
-    # Step 2: Measure side-stream scatters (serial on side)
-    # ==================================================================
-    print(f"\n  --- Step 2: Side-stream {num_shared}× scatter timing (serial) ---\n")
-
-    def _run_side_scatters(stream=None):
+    def _run_side_scatters():
         for idx in range(num_shared):
             ss = shared_states[idx]
             scatter_from_host_npu(
@@ -924,6 +987,25 @@ def run_experiment_4(
                 block_dim=block_dim,
             )
 
+    # ==================================================================
+    # Step 1: Phase 1 + side timing
+    # ==================================================================
+    print("\n  --- Step 1: Phase timings (serial) ---\n")
+
+    # T_phase1
+    times_p1 = []
+    for i in range(WARMUP + ITERS):
+        ev0 = torch.npu.Event(enable_timing=True)
+        ev1 = torch.npu.Event(enable_timing=True)
+        ev0.record()
+        _run_anchor_swap_in()
+        ev1.record()
+        torch.npu.synchronize()
+        if i >= WARMUP:
+            times_p1.append(ev0.elapsed_time(ev1))
+    T_phase1 = _median(times_p1)
+
+    # T_side
     times_side = []
     for i in range(WARMUP + ITERS):
         ev0 = torch.npu.Event(enable_timing=True)
@@ -935,198 +1017,141 @@ def run_experiment_4(
         if i >= WARMUP:
             times_side.append(ev0.elapsed_time(ev1))
     T_side_solo = _median(times_side)
-    print(f"    T_side ({num_shared}× scatter)  = {T_side_solo:8.3f} ms")
+
+    print(f"    T_phase1 (sieve+scatter) = {T_phase1:8.3f} ms")
+    print(f"    T_side ({num_shared}× scatter)   = {T_side_solo:8.3f} ms")
 
     # ==================================================================
-    # Step 3: Calibrate matmul configs
+    # Step 2: Calibrate all three attention proxy modes
     # ==================================================================
-    print("\n  --- Step 3: Calibrate matmul sizes (attention proxy) ---\n")
-    calibrated = _calibrate_matmul(device, ATTENTION_CONFIGS)
-    for n, reps, ms in calibrated:
-        print(f"    matmul({n}x{n}) x{reps:3d}  = {ms:8.3f} ms")
+    print("\n  --- Step 2: Calibrate attention proxies ---\n")
 
-    # ==================================================================
-    # Step 4: Full production timeline measurement
-    # ==================================================================
-    print("\n  --- Step 4: Production timeline (Phase 1 serial → Phase 2 parallel) ---\n")
+    modes = [
+        ("matmul",        MATMUL_CONFIGS,  _make_matmul_factory()),
+        ("matmul_softmax", SDPA_CONFIGS,    _make_matmul_softmax_factory()),
+        ("sdpa",          SDPA_CONFIGS,    _make_sdpa_factory()),
+    ]
 
-    side_stream = torch.npu.Stream()
-
-    prod_results = []
-
-    for n, reps, T_attn_solo in calibrated:
-        mat_a = torch.randn(n, n, dtype=torch.float16, device=device)
-        mat_b = torch.randn(n, n, dtype=torch.float16, device=device)
-        mat_c = torch.empty_like(mat_a)
-
-        # Serial baseline: everything on main stream
-        def run_all_serial():
-            sieve_update_npu(
-                layer_id=0,
-                topk_indices=state_anchor["topk_indices"],
-                req_pool_indices=state_anchor["req_pool_indices"],
-                seq_lens=state_anchor["seq_lens"],
-                prefill_len=state_anchor["prefill_len"],
-                device_buffer_tokens=state_anchor["device_buffer_tokens"],
-                device_buffer_visited=state_anchor["device_buffer_visited"],
-                device_buffer_ht=state_anchor["device_buffer_ht"][0],
-                sieve_hand=state_anchor["sieve_hand"],
-                top_k_device_slots=state_anchor["top_k_device_slots"],
-                is_miss=state_anchor["is_miss"],
-                num_real_reqs=state_anchor["num_real_reqs"],
-                top_k=TOP_K,
-                device_buffer_size=DEVICE_BUFFER_SIZE,
-                padded_buffer_size=PADDED_BUFFER_SIZE,
-                max_num_reqs=NUM_REQS,
-                block_dim=block_dim,
-            )
-            scatter_from_host_npu(
-                host_kv_cache_ptr=host_kv_dev_ptr,
-                topk_indices=state_anchor["topk_indices"],
-                top_k_device_slots=state_anchor["top_k_device_slots"],
-                is_miss=state_anchor["is_miss"],
-                req_pool_indices=state_anchor["req_pool_indices"],
-                req_to_host_pool=state_anchor["req_to_host_pool"],
-                req_to_device_buffer=state_anchor["req_to_device_buffer"],
-                device_k_buffer=state_anchor["device_k_buffer"],
-                device_v_buffer=state_anchor["device_v_buffer"],
-                layer_id=0,
-                host_entries=MAX_CONTEXT_LEN,
-                k_row_bytes=K_ROW_BYTES,
-                v_row_bytes=V_ROW_BYTES,
-                max_context_len=MAX_CONTEXT_LEN,
-                device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
-                padded_buffer_size=PADDED_BUFFER_SIZE,
-                max_num_reqs=NUM_REQS,
-                top_k=TOP_K,
-                block_dim=block_dim,
-            )
-            for _ in range(reps):
-                torch.matmul(mat_a, mat_b, out=mat_c)
-            _run_side_scatters()
-
-        # Production timeline: Phase 1 → fork → Phase 2 parallel
-        def run_production():
-            # Phase 1: sieve + scatter on main stream (serial)
-            sieve_update_npu(
-                layer_id=0,
-                topk_indices=state_anchor["topk_indices"],
-                req_pool_indices=state_anchor["req_pool_indices"],
-                seq_lens=state_anchor["seq_lens"],
-                prefill_len=state_anchor["prefill_len"],
-                device_buffer_tokens=state_anchor["device_buffer_tokens"],
-                device_buffer_visited=state_anchor["device_buffer_visited"],
-                device_buffer_ht=state_anchor["device_buffer_ht"][0],
-                sieve_hand=state_anchor["sieve_hand"],
-                top_k_device_slots=state_anchor["top_k_device_slots"],
-                is_miss=state_anchor["is_miss"],
-                num_real_reqs=state_anchor["num_real_reqs"],
-                top_k=TOP_K,
-                device_buffer_size=DEVICE_BUFFER_SIZE,
-                padded_buffer_size=PADDED_BUFFER_SIZE,
-                max_num_reqs=NUM_REQS,
-                block_dim=block_dim,
-            )
-            scatter_from_host_npu(
-                host_kv_cache_ptr=host_kv_dev_ptr,
-                topk_indices=state_anchor["topk_indices"],
-                top_k_device_slots=state_anchor["top_k_device_slots"],
-                is_miss=state_anchor["is_miss"],
-                req_pool_indices=state_anchor["req_pool_indices"],
-                req_to_host_pool=state_anchor["req_to_host_pool"],
-                req_to_device_buffer=state_anchor["req_to_device_buffer"],
-                device_k_buffer=state_anchor["device_k_buffer"],
-                device_v_buffer=state_anchor["device_v_buffer"],
-                layer_id=0,
-                host_entries=MAX_CONTEXT_LEN,
-                k_row_bytes=K_ROW_BYTES,
-                v_row_bytes=V_ROW_BYTES,
-                max_context_len=MAX_CONTEXT_LEN,
-                device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
-                padded_buffer_size=PADDED_BUFFER_SIZE,
-                max_num_reqs=NUM_REQS,
-                top_k=TOP_K,
-                block_dim=block_dim,
-            )
-
-            # Fork: side stream waits for main, then runs shared scatters
-            side_stream.wait_stream(torch.npu.current_stream())
-            with torch.npu.stream(side_stream):
-                _run_side_scatters()
-
-            # Phase 2: main stream continues with attention (matmul)
-            for _ in range(reps):
-                torch.matmul(mat_a, mat_b, out=mat_c)
-
-            # Join: main waits for side stream
-            torch.npu.current_stream().wait_stream(side_stream)
-
-        # Measure serial baseline
-        times_serial = []
-        for i in range(WARMUP + ITERS):
-            ev0 = torch.npu.Event(enable_timing=True)
-            ev1 = torch.npu.Event(enable_timing=True)
-            ev0.record()
-            run_all_serial()
-            ev1.record()
-            torch.npu.synchronize()
-            if i >= WARMUP:
-                times_serial.append(ev0.elapsed_time(ev1))
-
-        # Measure production timeline
-        times_prod = []
-        for i in range(WARMUP + ITERS):
-            ev0 = torch.npu.Event(enable_timing=True)
-            ev1 = torch.npu.Event(enable_timing=True)
-            ev0.record()
-            run_production()
-            ev1.record()
-            torch.npu.synchronize()
-            if i >= WARMUP:
-                times_prod.append(ev0.elapsed_time(ev1))
-
-        T_serial = _median(times_serial)
-        T_prod = _median(times_prod)
-        speedup = T_serial / T_prod if T_prod > 0 else 0
-
-        # Coverage: how much of T_side is hidden behind T_attention?
-        # T_prod ≈ T_phase1 + max(T_attention, T_side)
-        # If T_attention >= T_side → full coverage (100%)
-        # If T_attention <  T_side → partial coverage
-        if T_side_solo > 0:
-            coverage = max(0.0, min(1.0, T_attn_solo / T_side_solo))
-        else:
-            coverage = 1.0
-
-        label = f"attn=matmul({n}x{n})x{reps} ({T_attn_solo:.1f}ms)"
-        print(f"  [{label}]")
-        print(f"    serial baseline  {_fmt_ms(times_serial)}")
-        print(f"    production       {_fmt_ms(times_prod)}")
-        print(f"    speedup = {speedup:.2f}x  "
-              f"(saved {T_serial - T_prod:.1f} ms)")
-        print(f"    side coverage = {coverage * 100:.0f}%  "
-              f"(T_attention={T_attn_solo:.1f}ms vs T_side={T_side_solo:.1f}ms)")
+    calibrated = {}
+    for mode_name, configs, factory in modes:
+        print(f"    [{mode_name}]")
+        cal = _calibrate_workload(device, factory, configs)
+        for cfg_val in cal:
+            if mode_name == "matmul":
+                print(f"      matmul({cfg_val[0]}x{cfg_val[0]}) x{cfg_val[1]:3d}  = {cfg_val[2]:8.3f} ms")
+            else:
+                print(f"      kv_len={cfg_val[0]:4d} x{cfg_val[1]}  = {cfg_val[2]:8.3f} ms")
+        calibrated[mode_name] = cal
         print()
 
-        prod_results.append((n, reps, T_attn_solo, T_serial, T_prod,
-                             speedup, coverage))
+    # ==================================================================
+    # Step 3: Production timeline per mode
+    # ==================================================================
+    print("  --- Step 3: Production timeline (Phase 1 → fork → Phase 2) ---\n")
 
-        del mat_a, mat_b, mat_c
-        torch.npu.empty_cache()
+    side_stream = torch.npu.Stream()
+    all_results = {}
+
+    for mode_name, configs, factory in modes:
+        print(f"  ====== Mode: {mode_name} ======\n")
+        mode_results = []
+
+        for cfg in calibrated[mode_name]:
+            workload, cleanup = factory(device, cfg)
+            T_attn_solo = cfg[-1]
+
+            # Serial baseline
+            def run_serial(_workload=workload):
+                _run_anchor_swap_in()
+                _workload()
+                _run_side_scatters()
+
+            # Production: Phase 1 → fork → Phase 2
+            def run_production(_workload=workload):
+                _run_anchor_swap_in()
+                side_stream.wait_stream(torch.npu.current_stream())
+                with torch.npu.stream(side_stream):
+                    _run_side_scatters()
+                _workload()
+                torch.npu.current_stream().wait_stream(side_stream)
+
+            times_serial = []
+            for i in range(WARMUP + ITERS):
+                ev0 = torch.npu.Event(enable_timing=True)
+                ev1 = torch.npu.Event(enable_timing=True)
+                ev0.record()
+                run_serial()
+                ev1.record()
+                torch.npu.synchronize()
+                if i >= WARMUP:
+                    times_serial.append(ev0.elapsed_time(ev1))
+
+            times_prod = []
+            for i in range(WARMUP + ITERS):
+                ev0 = torch.npu.Event(enable_timing=True)
+                ev1 = torch.npu.Event(enable_timing=True)
+                ev0.record()
+                run_production()
+                ev1.record()
+                torch.npu.synchronize()
+                if i >= WARMUP:
+                    times_prod.append(ev0.elapsed_time(ev1))
+
+            T_serial = _median(times_serial)
+            T_prod = _median(times_prod)
+            speedup = T_serial / T_prod if T_prod > 0 else 0
+
+            if T_side_solo > 0:
+                coverage = max(0.0, min(1.0, T_attn_solo / T_side_solo))
+            else:
+                coverage = 1.0
+
+            # DMA contention factor: how much did T_prod exceed the ideal?
+            # Ideal = T_phase1 + max(T_attn, T_side)
+            T_ideal = T_phase1 + max(T_attn_solo, T_side_solo)
+            contention = (T_prod - T_ideal) / T_ideal * 100 if T_ideal > 0 else 0
+
+            if mode_name == "matmul":
+                label = f"matmul({cfg[0]}x{cfg[0]})x{cfg[1]}"
+            else:
+                label = f"{mode_name}(kv={cfg[0]},x{cfg[1]})"
+            print(f"    [{label}]  T_attn={T_attn_solo:.1f}ms")
+            print(f"      serial  {_fmt_ms(times_serial)}")
+            print(f"      prod    {_fmt_ms(times_prod)}")
+            print(f"      speedup={speedup:.2f}x  coverage={coverage*100:.0f}%  "
+                  f"contention={contention:+.1f}%")
+            print()
+
+            mode_results.append((cfg, T_attn_solo, T_serial, T_prod,
+                                 speedup, coverage, contention))
+            cleanup()
+
+        all_results[mode_name] = mode_results
 
     # ==================================================================
-    # Step 5: Summary table
+    # Step 4: Cross-mode comparison table
     # ==================================================================
-    print("\n  ┌────────────────────────────────────────────────────────────────────────────────┐")
-    print(f"  │ Summary: Production pipeline (1 anchor + {num_shared} shared, block_dim={block_dim})          │")
-    print(f"  │ T_phase1={T_phase1:.1f}ms  T_side({num_shared}×scatter)={T_side_solo:.1f}ms                              │")
-    print(f"  ├────────────────────┬──────────┬──────────┬──────────┬──────────┬──────────────┤")
-    print(f"  │ attention config   │ T_attn   │ T_serial │ T_prod   │ speedup  │ side cover   │")
-    print(f"  ├────────────────────┼──────────┼──────────┼──────────┼──────────┼──────────────┤")
-    for n, reps, t_attn, t_ser, t_prod, sp, cov in prod_results:
-        tag = " <<<" if sp == max(r[5] for r in prod_results) else ""
-        print(f"  │ ({n}x{n})x{reps:<3d}        │ {t_attn:8.1f} │ {t_ser:8.1f} │ {t_prod:8.1f} │ {sp:7.2f}x │ {cov*100:10.0f}%  │{tag}")
-    print(f"  └────────────────────┴──────────┴──────────┴──────────┴──────────┴──────────────┘")
+    print("\n  ╔══════════════════════════════════════════════════════════════════════════╗")
+    print(f"  ║ Cross-mode comparison (1 anchor + {num_shared} shared, block_dim={block_dim})              ║")
+    print(f"  ║ T_phase1={T_phase1:.1f}ms  T_side={T_side_solo:.1f}ms                                           ║")
+    print(f"  ╠══════════════════════════════════╦══════════╦══════════╦══════════╦═══════════╣")
+    print(f"  ║ attention proxy                  ║ T_attn   ║ T_prod   ║ speedup  ║ contention║")
+    print(f"  ╠══════════════════════════════════╬══════════╬══════════╬══════════╬═══════════╣")
+
+    for mode_name in ["matmul", "matmul_softmax", "sdpa"]:
+        for cfg, t_attn, t_ser, t_prod, sp, cov, cont in all_results[mode_name]:
+            if mode_name == "matmul":
+                desc = f"matmul({cfg[0]}x{cfg[0]})x{cfg[1]}"
+            else:
+                desc = f"{mode_name}(kv={cfg[0]},x{cfg[1]})"
+            print(f"  ║ {desc:<32} ║ {t_attn:8.1f} ║ {t_prod:8.1f} ║ {sp:7.2f}x ║ {cont:+9.1f}% ║")
+
+    print(f"  ╚══════════════════════════════════╩══════════╩══════════╩══════════╩═══════════╝")
+    print()
+    print("  Legend:")
+    print("    contention = (T_prod - T_ideal) / T_ideal * 100")
+    print("    T_ideal = T_phase1 + max(T_attn, T_side)")
+    print("    Higher contention → more DMA bandwidth conflict between attention and scatter")
 
 
 # ===========================================================================
