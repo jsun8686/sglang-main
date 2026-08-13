@@ -31,8 +31,10 @@ def get_npu_numa_node(device_id: int) -> Optional[int]:
     """Best-effort query of the NUMA node local to an NPU die.
 
     Scans PCI sysfs for Huawei (vendor 0x19e5) accelerator devices, sorts them
-    by BDF and takes the device_id-th one.  Returns None when the mapping
-    cannot be determined.
+    by BDF. Ascend 910 packs multiple dies per physical chip sharing one PCI
+    endpoint, so device_id is mapped to endpoint via ``device_id // dies_per_endpoint``
+    where ``dies_per_endpoint = ceil(num_npu_devices / num_endpoints)``.
+    Returns None when the mapping cannot be determined.
     """
     try:
         devices = []
@@ -52,15 +54,27 @@ def get_npu_numa_node(device_id: int) -> Optional[int]:
                 continue
         devices.sort()
         if devices and device_id >= 0:
-            if device_id >= len(devices):
-                logger.info(
-                    "get_npu_numa_node: device_id %d has no dedicated PCI "
-                    "endpoint (%d found), mapping to endpoint %d",
-                    device_id,
-                    len(devices),
-                    device_id % len(devices),
-                )
-            return devices[device_id % len(devices)][1]
+            num_endpoints = len(devices)
+            try:
+                num_npu_devices = torch.npu.device_count()
+            except Exception:
+                num_npu_devices = num_endpoints
+            dies_per_endpoint = max(
+                1, (num_npu_devices + num_endpoints - 1) // num_endpoints
+            )
+            endpoint_idx = min(
+                device_id // dies_per_endpoint, num_endpoints - 1
+            )
+            logger.info(
+                "get_npu_numa_node: device_id %d -> endpoint %d "
+                "(dies_per_endpoint=%d, num_endpoints=%d, numa_node=%d)",
+                device_id,
+                endpoint_idx,
+                dies_per_endpoint,
+                num_endpoints,
+                devices[endpoint_idx][1],
+            )
+            return devices[endpoint_idx][1]
     except Exception:
         pass
     return None

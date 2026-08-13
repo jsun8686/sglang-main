@@ -1328,7 +1328,7 @@ class HiSparseCoordinator:
 
     def _admit_request_into_staging_npu(self, req: Req) -> None:
         logical_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, : req.extend_range.end
         ]
         device_indices = self.mem_pool_device._translate_loc_to_hisparse_device(
             logical_indices
