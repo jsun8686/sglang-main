@@ -2628,14 +2628,13 @@ class AscendAttnBackend(AttentionBackend):
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:
-            if forward_batch.hisparse_coordinator is not None:
-                page_table_1 = (
-                    forward_batch.hisparse_coordinator.swap_in_selected_pages(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        topk_indices,
-                        layer.layer_id,
-                    )
+            coordinator = getattr(forward_batch, "hisparse_coordinator", None)
+            if coordinator is not None:
+                page_table_1 = coordinator.swap_in_selected_pages(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    topk_indices,
+                    layer.layer_id,
                 )
                 return self.forward_sparse(
                     q,
