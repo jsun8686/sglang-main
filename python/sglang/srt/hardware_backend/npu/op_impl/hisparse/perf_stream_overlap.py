@@ -26,6 +26,11 @@ hardware-level cross-stream parallelism (DMA vs compute overlap):
            - matmul_softmax: Cube + Vector — adds softmax pipeline
            - sdpa:          Cube + Vector + MTE — real attention DMA contention
 
+  Exp 4b: Side-stream block_dim sweep.
+          Fixed attention: sdpa(kv=2048, x4) = GLM-5.2 decode scenario.
+          Phase 1 (anchor) always block_dim=48; sweep side-stream scatter
+          block_dim to find optimal AIV core partition (910B = 24 AIC + 48 AIV).
+
 Usage on NPU host:
   # Exp 0 only (no kernel build needed):
   python perf_stream_overlap.py --exp 0
@@ -1151,6 +1156,293 @@ def run_experiment_4(
 
 
 # ===========================================================================
+# Experiment 4b: Side-stream block_dim sweep
+# ===========================================================================
+#
+# Fixed: sdpa(kv=2048, x4) as attention proxy (GLM-5.2 decode scenario).
+# Phase 1 (sieve+scatter anchor) always uses block_dim=48 (fastest serial).
+# Sweep: side-stream scatter block_dim to find optimal AIV core partition.
+#
+# Background: 910B has 24 AIC + 48 AIV.  sdpa uses ~48 AIV (CV split).
+# scatter also uses AIV (DataCopy + scan).  When both want 48 AIV, they
+# compete for physical cores → high contention (+49% in Exp 4).
+# Reducing side-stream block_dim frees AIV cores for attention.
+
+SIDE_BLOCK_DIMS = [48, 40, 32, 24, 16, 12, 8, 4]
+
+# GLM-5.2 decode attention config: kv_len=2048, 4 layers
+SDPA_KV_LEN = 2048
+SDPA_REPS = 4
+
+
+def run_experiment_4b(
+    device: str,
+    state_anchor: Dict[str, torch.Tensor],
+    shared_states: List[Dict[str, torch.Tensor]],
+    host_kv_dev_ptr: int,
+    num_shared: int,
+) -> None:
+    """
+    Side-stream block_dim sweep with fixed sdpa(kv=2048) attention proxy.
+
+    Finds the optimal AIV core partition between main-stream attention
+    and side-stream scatter to minimize total pipeline time.
+    """
+    print("=" * 72)
+    print(f"Experiment 4b: Side-stream block_dim sweep")
+    print(f"  Fixed attention: sdpa(kv={SDPA_KV_LEN}, x{SDPA_REPS}) = 4 decode layers")
+    print(f"  Phase 1: sieve+scatter(anchor) block_dim=48 (serial, fastest)")
+    print(f"  Sweep: side-stream {num_shared}× scatter block_dim in {SIDE_BLOCK_DIMS}")
+    print(f"  Goal: minimize contention by freeing AIV cores for attention")
+    print("=" * 72)
+
+    from sglang.srt.hardware_backend.npu.op_impl.hisparse import (
+        sieve_update_npu,
+        scatter_from_host_npu,
+    )
+    from torch.nn.functional import scaled_dot_product_attention as sdpa
+
+    PHASE1_BD = 48
+
+    # --- Prepare states ---
+    state_anchor["topk_indices"].copy_(
+        _gen_topk(device, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE, MISS_RATIO)
+    )
+    _init_tokens(state_anchor, DEVICE_BUFFER_SIZE)
+    for ss in shared_states[:num_shared]:
+        _pre_populate_for_scatter(ss, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
+
+    # --- Allocate attention tensors ---
+    num_heads = 16
+    head_dim = 128
+    batch = NUM_REQS
+    attn_st = dict(
+        q=torch.randn(batch, num_heads, 1, head_dim, dtype=torch.float16, device=device),
+        k=torch.randn(batch, num_heads, SDPA_KV_LEN, head_dim, dtype=torch.float16, device=device),
+        v=torch.randn(batch, num_heads, SDPA_KV_LEN, head_dim, dtype=torch.float16, device=device),
+    )
+
+    def _run_attention():
+        for _ in range(SDPA_REPS):
+            sdpa(attn_st["q"], attn_st["k"], attn_st["v"])
+
+    def _run_phase1():
+        sieve_update_npu(
+            layer_id=0,
+            topk_indices=state_anchor["topk_indices"],
+            req_pool_indices=state_anchor["req_pool_indices"],
+            seq_lens=state_anchor["seq_lens"],
+            prefill_len=state_anchor["prefill_len"],
+            device_buffer_tokens=state_anchor["device_buffer_tokens"],
+            device_buffer_visited=state_anchor["device_buffer_visited"],
+            device_buffer_ht=state_anchor["device_buffer_ht"][0],
+            sieve_hand=state_anchor["sieve_hand"],
+            top_k_device_slots=state_anchor["top_k_device_slots"],
+            is_miss=state_anchor["is_miss"],
+            num_real_reqs=state_anchor["num_real_reqs"],
+            top_k=TOP_K,
+            device_buffer_size=DEVICE_BUFFER_SIZE,
+            padded_buffer_size=PADDED_BUFFER_SIZE,
+            max_num_reqs=NUM_REQS,
+            block_dim=PHASE1_BD,
+        )
+        scatter_from_host_npu(
+            host_kv_cache_ptr=host_kv_dev_ptr,
+            topk_indices=state_anchor["topk_indices"],
+            top_k_device_slots=state_anchor["top_k_device_slots"],
+            is_miss=state_anchor["is_miss"],
+            req_pool_indices=state_anchor["req_pool_indices"],
+            req_to_host_pool=state_anchor["req_to_host_pool"],
+            req_to_device_buffer=state_anchor["req_to_device_buffer"],
+            device_k_buffer=state_anchor["device_k_buffer"],
+            device_v_buffer=state_anchor["device_v_buffer"],
+            layer_id=0,
+            host_entries=MAX_CONTEXT_LEN,
+            k_row_bytes=K_ROW_BYTES,
+            v_row_bytes=V_ROW_BYTES,
+            max_context_len=MAX_CONTEXT_LEN,
+            device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+            padded_buffer_size=PADDED_BUFFER_SIZE,
+            max_num_reqs=NUM_REQS,
+            top_k=TOP_K,
+            block_dim=PHASE1_BD,
+        )
+
+    def _make_side_scatter_fn(side_bd):
+        def _run_side():
+            for idx in range(num_shared):
+                ss = shared_states[idx]
+                scatter_from_host_npu(
+                    host_kv_cache_ptr=host_kv_dev_ptr,
+                    topk_indices=ss["topk_indices"],
+                    top_k_device_slots=ss["top_k_device_slots"],
+                    is_miss=ss["is_miss"],
+                    req_pool_indices=ss["req_pool_indices"],
+                    req_to_host_pool=ss["req_to_host_pool"],
+                    req_to_device_buffer=ss["req_to_device_buffer"],
+                    device_k_buffer=ss["device_k_buffer"],
+                    device_v_buffer=ss["device_v_buffer"],
+                    layer_id=1 + idx,
+                    host_entries=MAX_CONTEXT_LEN,
+                    k_row_bytes=K_ROW_BYTES,
+                    v_row_bytes=V_ROW_BYTES,
+                    max_context_len=MAX_CONTEXT_LEN,
+                    device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+                    padded_buffer_size=PADDED_BUFFER_SIZE,
+                    max_num_reqs=NUM_REQS,
+                    top_k=TOP_K,
+                    block_dim=side_bd,
+                )
+        return _run_side
+
+    # ==================================================================
+    # Step 1: Baseline timings (all serial, block_dim=48)
+    # ==================================================================
+    print("\n  --- Step 1: Baseline timings (serial, block_dim=48) ---\n")
+
+    # T_attn_solo
+    times_attn = []
+    for i in range(WARMUP + ITERS):
+        ev0 = torch.npu.Event(enable_timing=True)
+        ev1 = torch.npu.Event(enable_timing=True)
+        ev0.record()
+        _run_attention()
+        ev1.record()
+        torch.npu.synchronize()
+        if i >= WARMUP:
+            times_attn.append(ev0.elapsed_time(ev1))
+    T_attn_solo = _median(times_attn)
+
+    # T_phase1
+    times_p1 = []
+    for i in range(WARMUP + ITERS):
+        ev0 = torch.npu.Event(enable_timing=True)
+        ev1 = torch.npu.Event(enable_timing=True)
+        ev0.record()
+        _run_phase1()
+        ev1.record()
+        torch.npu.synchronize()
+        if i >= WARMUP:
+            times_p1.append(ev0.elapsed_time(ev1))
+    T_phase1 = _median(times_p1)
+
+    # T_side at block_dim=48 (baseline)
+    _run_side_48 = _make_side_scatter_fn(48)
+    times_side = []
+    for i in range(WARMUP + ITERS):
+        ev0 = torch.npu.Event(enable_timing=True)
+        ev1 = torch.npu.Event(enable_timing=True)
+        ev0.record()
+        _run_side_48()
+        ev1.record()
+        torch.npu.synchronize()
+        if i >= WARMUP:
+            times_side.append(ev0.elapsed_time(ev1))
+    T_side_48 = _median(times_side)
+
+    # Full serial baseline (phase1 + attn + side, all block_dim=48)
+    times_full_serial = []
+    for i in range(WARMUP + ITERS):
+        ev0 = torch.npu.Event(enable_timing=True)
+        ev1 = torch.npu.Event(enable_timing=True)
+        ev0.record()
+        _run_phase1()
+        _run_attention()
+        _run_side_48()
+        ev1.record()
+        torch.npu.synchronize()
+        if i >= WARMUP:
+            times_full_serial.append(ev0.elapsed_time(ev1))
+    T_full_serial = _median(times_full_serial)
+
+    print(f"    T_attn(sdpa kv={SDPA_KV_LEN} x{SDPA_REPS}) = {T_attn_solo:8.3f} ms")
+    print(f"    T_phase1 (sieve+scatter bd=48)       = {T_phase1:8.3f} ms")
+    print(f"    T_side ({num_shared}× scatter bd=48)          = {T_side_48:8.3f} ms")
+    print(f"    T_full_serial (all serial)           = {T_full_serial:8.3f} ms")
+
+    # ==================================================================
+    # Step 2: Sweep side-stream block_dim
+    # ==================================================================
+    print(f"\n  --- Step 2: Sweep side-stream block_dim ---\n")
+
+    side_stream = torch.npu.Stream()
+    sweep_results = []
+
+    for side_bd in SIDE_BLOCK_DIMS:
+        _run_side = _make_side_scatter_fn(side_bd)
+
+        # Measure T_side at this block_dim (solo)
+        times_side_bd = []
+        for i in range(WARMUP + ITERS):
+            ev0 = torch.npu.Event(enable_timing=True)
+            ev1 = torch.npu.Event(enable_timing=True)
+            ev0.record()
+            _run_side()
+            ev1.record()
+            torch.npu.synchronize()
+            if i >= WARMUP:
+                times_side_bd.append(ev0.elapsed_time(ev1))
+        T_side_bd = _median(times_side_bd)
+
+        # Production timeline: Phase 1 → fork → attention || side_scatter
+        times_prod = []
+        for i in range(WARMUP + ITERS):
+            ev0 = torch.npu.Event(enable_timing=True)
+            ev1 = torch.npu.Event(enable_timing=True)
+            ev0.record()
+            _run_phase1()
+            side_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(side_stream):
+                _run_side()
+            _run_attention()
+            torch.npu.current_stream().wait_stream(side_stream)
+            ev1.record()
+            torch.npu.synchronize()
+            if i >= WARMUP:
+                times_prod.append(ev0.elapsed_time(ev1))
+
+        T_prod = _median(times_prod)
+        speedup = T_full_serial / T_prod if T_prod > 0 else 0
+        T_ideal = T_phase1 + max(T_attn_solo, T_side_bd)
+        contention = (T_prod - T_ideal) / T_ideal * 100 if T_ideal > 0 else 0
+
+        # How much of T_side is hidden behind T_attn?
+        coverage = max(0.0, min(1.0, T_attn_solo / T_side_bd)) if T_side_bd > 0 else 1.0
+
+        print(f"  [side_bd={side_bd:2d}]  T_side={T_side_bd:6.2f}ms  "
+              f"T_prod={T_prod:6.2f}ms  speedup={speedup:.2f}x  "
+              f"contention={contention:+6.1f}%  coverage={coverage*100:3.0f}%")
+
+        sweep_results.append((side_bd, T_side_bd, T_prod, speedup,
+                              contention, coverage))
+
+    # ==================================================================
+    # Step 3: Summary table
+    # ==================================================================
+    best = max(sweep_results, key=lambda r: r[3])  # best speedup
+
+    print(f"\n  ╔══════════════════════════════════════════════════════════════════════════════╗")
+    print(f"  ║ Experiment 4b: Side-stream block_dim sweep                                  ║")
+    print(f"  ║ Fixed: sdpa(kv={SDPA_KV_LEN},x{SDPA_REPS})={T_attn_solo:.1f}ms  T_phase1={T_phase1:.1f}ms  T_serial={T_full_serial:.1f}ms            ║")
+    print(f"  ╠══════════╦════════════╦══════════╦══════════╦══════════════╦═══════════════╣")
+    print(f"  ║ side_bd  ║ T_side     ║ T_prod   ║ speedup  ║ contention   ║ coverage      ║")
+    print(f"  ╠══════════╬════════════╬══════════╬══════════╬══════════════╬═══════════════╣")
+    for side_bd, t_side, t_prod, sp, cont, cov in sweep_results:
+        tag = " <<<" if side_bd == best[0] else ""
+        print(f"  ║ {side_bd:8d} ║ {t_side:8.2f} ms ║ {t_prod:8.2f} ║ {sp:7.2f}x ║ {cont:+10.1f}%  ║ {cov*100:10.0f}%   ║{tag}")
+    print(f"  ╚══════════╩════════════╩══════════╩══════════╩══════════════╩═══════════════╝")
+    print()
+    print(f"  Best: side_bd={best[0]} → speedup={best[3]:.2f}x "
+          f"(T_prod={best[2]:.2f}ms vs serial={T_full_serial:.2f}ms)")
+    print(f"  T_side grows from {sweep_results[0][1]:.2f}ms (bd=48) to "
+          f"{sweep_results[-1][1]:.2f}ms (bd={sweep_results[-1][0]}) "
+          f"→ trade-off: fewer cores = slower scatter but less contention")
+
+    del attn_st
+    torch.npu.empty_cache()
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -1162,7 +1454,7 @@ def main():
     )
     parser.add_argument(
         "--exp", type=str, default="0",
-        choices=["0", "1", "2", "3", "4", "all"],
+        choices=["0", "1", "2", "3", "4", "4b", "all"],
         help="Which experiment to run (default: 0)",
     )
     parser.add_argument(
@@ -1202,14 +1494,15 @@ def main():
     run_exp2 = args.exp in ("2", "all")
     run_exp3 = args.exp in ("3", "all")
     run_exp4 = args.exp in ("4", "all")
+    run_exp4b = args.exp in ("4b", "all")
     num_shared = args.num_shared
 
     # --- Experiment 0 ---
     if run_exp0:
         run_experiment_0(device)
 
-    # --- Experiments 1, 2, 3, 4 (require kernel build) ---
-    if run_exp1 or run_exp2 or run_exp3 or run_exp4:
+    # --- Experiments 1, 2, 3, 4, 4b (require kernel build) ---
+    if run_exp1 or run_exp2 or run_exp3 or run_exp4 or run_exp4b:
         from sglang.srt.hardware_backend.npu.op_impl import hisparse as hisparse_pkg
         if not hisparse_pkg._HAS_KERNEL:
             print("\nERROR: hisparse_lru native extension not built.")
@@ -1256,6 +1549,17 @@ def main():
                     for _ in range(num_shared)
                 ]
                 run_experiment_4(
+                    device, state_a, shared_states, host_kv_dev_ptr,
+                    num_shared=num_shared,
+                )
+                del shared_states
+
+            if run_exp4b:
+                shared_states = [
+                    _make_state(device, NUM_REQS, TOP_K, DEVICE_BUFFER_SIZE)
+                    for _ in range(num_shared)
+                ]
+                run_experiment_4b(
                     device, state_a, shared_states, host_kv_dev_ptr,
                     num_shared=num_shared,
                 )
