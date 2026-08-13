@@ -1851,8 +1851,8 @@ def _make_real_moe_workload(device):
     expanded_len = batch * top_k  # 1024
 
     # Weights for 8 active experts (not all 256 — only decode-active ones)
-    w13 = torch.randn(num_experts, 2 * inter, hidden, dtype=GLM_DTYPE, device=device)
-    w2 = torch.randn(num_experts, hidden, inter, dtype=GLM_DTYPE, device=device)
+    w13 = torch.randn(num_experts, hidden, 2 * inter, dtype=GLM_DTYPE, device=device)
+    w2 = torch.randn(num_experts, inter, hidden, dtype=GLM_DTYPE, device=device)
 
     # Routing inputs: each of 128 tokens routes to top_k=8 experts
     # Distribute tokens roughly evenly across experts
