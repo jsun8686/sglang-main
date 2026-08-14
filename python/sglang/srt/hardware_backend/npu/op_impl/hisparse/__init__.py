@@ -309,9 +309,87 @@ def scatter_from_host_npu(
     )
 
 
+def scatter_from_host_group_npu(
+    host_kv_cache_ptr: int,
+    topk_indices: torch.Tensor,
+    top_k_device_slots: torch.Tensor,
+    is_miss: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_host_pool: torch.Tensor,
+    req_to_device_buffer: torch.Tensor,
+    device_k_buffer: torch.Tensor,
+    device_v_buffer: torch.Tensor,
+    anchor_layer_id: int,
+    group_size: int,
+    host_entries: int,
+    k_row_bytes: int,
+    v_row_bytes: int,
+    max_context_len: int,
+    device_buffer_row_stride: int,
+    padded_buffer_size: int,
+    max_num_reqs: int,
+    top_k: int,
+    block_dim: int = 0,
+) -> None:
+    """
+    Group scatter for IndexShare models: scatter missing KV rows into the
+    anchor layer's device buffer AND its trailing shared-index (skip) layers'
+    buffers in one launch.
+
+    ``device_k_buffer`` / ``device_v_buffer`` must be the FULL layer-stacked
+    pools (shape ``[layer_num, ...]``); the kernel derives each group layer's
+    base from ``anchor_layer_id + g``.  ``group_size = 1 + number of skip
+    layers`` covered by this anchor.  Skip layers then reuse the anchor's
+    ``top_k_device_slots`` directly without launching their own kernels.
+    """
+    if k_row_bytes <= 0 or v_row_bytes <= 0:
+        raise ValueError(
+            "scatter_from_host_group_npu: k_row_bytes and v_row_bytes must be > 0"
+        )
+    if k_row_bytes % 32 != 0 or v_row_bytes % 32 != 0:
+        raise ValueError(
+            "scatter_from_host_group_npu: k_row_bytes and v_row_bytes must be "
+            "multiples of 32 bytes"
+        )
+    if device_k_buffer.dim() < 2 or device_k_buffer.size(0) != device_v_buffer.size(0):
+        raise ValueError(
+            "scatter_from_host_group_npu: device buffers must be the full "
+            "layer-stacked pools with matching layer counts"
+        )
+    layer_num = device_k_buffer.size(0)
+    if not (0 <= anchor_layer_id < layer_num):
+        raise ValueError("scatter_from_host_group_npu: anchor_layer_id out of range")
+    if not (1 <= group_size <= layer_num - anchor_layer_id):
+        raise ValueError("scatter_from_host_group_npu: group exceeds the layer range")
+    _require_kernel()
+    _hisparse_lru.scatter_from_host_group(
+        host_kv_cache_ptr,
+        topk_indices,
+        top_k_device_slots,
+        is_miss,
+        req_pool_indices,
+        req_to_host_pool,
+        req_to_device_buffer,
+        device_k_buffer,
+        device_v_buffer,
+        anchor_layer_id,
+        group_size,
+        host_entries,
+        k_row_bytes,
+        v_row_bytes,
+        max_context_len,
+        device_buffer_row_stride,
+        padded_buffer_size,
+        max_num_reqs,
+        top_k,
+        _resolve_block_dim(block_dim),
+    )
+
+
 __all__ = [
     "lru_update_npu",
     "sieve_update_npu",
     "sieve_ht_init_npu",
     "scatter_from_host_npu",
+    "scatter_from_host_group_npu",
 ]

@@ -156,7 +156,9 @@ class HiSparseCoordinator:
             )
 
         # NPU uses a different swap-in path; the CUDA plan-then-IO prefetch
-        # is not applicable (IndexShare scatter will be handled separately).
+        # stream machinery is not applicable.  NPU instead groups the
+        # shared-index layers under their anchor: the anchor's scatter fills
+        # the whole group's device buffers and skip layers become no-ops.
         if not self.is_npu:
             self._init_shared_index_prefetch(
                 shared_index_layers=shared_index_layers,
@@ -164,10 +166,10 @@ class HiSparseCoordinator:
                 max_num_req_slots=req_to_token_pool.req_to_token.shape[0],
             )
         else:
-            self.enable_prefetch = False
-            self._is_shared_index_layer = None
-            self._prefetch_groups = {}
-            self._prefetch_slot = []
+            self._init_shared_index_npu(
+                shared_index_layers=shared_index_layers,
+                layer_num=self.mem_pool_device.layer_num,
+            )
 
     def _init_cuda(
         self,
@@ -446,6 +448,12 @@ class HiSparseCoordinator:
             os.environ.get("HISPARSE_MISS_STATS_INTERVAL", "20")
         )
         self._layer_num = layer_num
+        # Layers that actually run LRU/SIEVE + scatter at decode.  Defaults
+        # cover the non-shared path (every layer); _init_shared_index_npu
+        # overrides these when IndexShare grouping is active.
+        self._swap_layers = list(range(layer_num))
+        self._last_swap_layer = layer_num - 1
+        self._swap_layer_count = layer_num
         self._stats_rank0 = torch.distributed.get_rank(self.tp_group) == 0
         if self._miss_stats_on:
             self._miss_rows_accum = torch.zeros(1, dtype=torch.int64, device=device)
@@ -562,6 +570,49 @@ class HiSparseCoordinator:
             sum(self._is_shared_index_layer),
             layer_num,
         )
+
+    def _init_shared_index_npu(
+        self,
+        shared_index_layers: Optional[List[bool]],
+        layer_num: int,
+    ) -> None:
+        """Set up IndexShare group tracking for the NPU swap-in path.
+
+        Anchors run LRU/SIEVE once and a single group-scatter kernel fills
+        their trailing shared-index (skip) layers' device buffers; skip
+        layers return the anchor's slot table directly (zero kernel work).
+        Correctness rests on the lockstep invariant: admission initializes
+        and finish/abort clears every layer's buffer state identically, and
+        only anchors ever mutate the shared slot table, so a group's layers
+        always agree on slot contents.
+        """
+        if shared_index_layers is not None and len(shared_index_layers) != layer_num:
+            logger.warning(
+                "HiSparse NPU shared-index grouping disabled: pattern length "
+                "%d != KV pool layer_num %d; using per-layer swap-in.",
+                len(shared_index_layers),
+                layer_num,
+            )
+            shared_index_layers = None
+        self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
+        self.enable_prefetch = any(self._is_shared_index_layer)
+        self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
+            self._is_shared_index_layer
+        )
+        if self.enable_prefetch:
+            self._swap_layers = [
+                i for i, shared in enumerate(self._is_shared_index_layer) if not shared
+            ]
+            self._last_swap_layer = max(self._swap_layers)
+            self._swap_layer_count = len(self._swap_layers)
+            logger.info(
+                "HiSparse NPU: shared-index group swap-in enabled; %d anchor "
+                "group(s), %d skip layer(s) of %d total (%d swap-in layers).",
+                len(self._prefetch_groups),
+                sum(self._is_shared_index_layer),
+                layer_num,
+                self._swap_layer_count,
+            )
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -1599,6 +1650,13 @@ class HiSparseCoordinator:
             slots.masked_fill_(top_k_result == -1, -1)
             return slots.view(num_real, 1, -1)
 
+        # IndexShare skip layer: reuse the anchor's swap-in results.  Same
+        # top-k indices -> same LRU/SIEVE decisions -> same slot table, and
+        # the anchor's group scatter already filled this layer's device
+        # buffer (lockstep layout), so there is nothing left to do.
+        if self.enable_prefetch and self._is_shared_index_layer[layer_id]:
+            return self.top_k_device_slots[:num_real].view(num_real, 1, -1)
+
         self._load_cache_to_device_buffer_npu(
             top_k_tokens=top_k_result,
             req_pool_indices=req_pool_indices,
@@ -1622,7 +1680,9 @@ class HiSparseCoordinator:
             self.top_k_device_slots.fill_(-1)
 
         timed_layer = (
-            self._miss_stats_on and layer_id == self._stats_steps % self._layer_num
+            self._miss_stats_on
+            and layer_id
+            == self._swap_layers[self._stats_steps % self._swap_layer_count]
         )
         if timed_layer:
             ev_lru_start, ev_lru_end, ev_scatter_end = self._timing_events[
@@ -1677,26 +1737,53 @@ class HiSparseCoordinator:
             slots.masked_fill_(top_k_tokens == -1, -1)
             return
 
-        self._lru_npu.scatter_from_host_npu(
-            host_kv_cache_ptr=self.host_kv_cache_base_ptr,
-            topk_indices=top_k_tokens,
-            top_k_device_slots=self.top_k_device_slots,
-            is_miss=self.is_miss,
-            req_pool_indices=req_pool_indices,
-            req_to_host_pool=self.req_to_host_pool,
-            req_to_device_buffer=self.req_to_device_buffer,
-            device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
-            device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
-            layer_id=layer_id,
-            host_entries=self.mem_pool_host.host_entries,
-            k_row_bytes=self.mem_pool_device.kv_lora_rank * self.mem_pool_device.dtype.itemsize,
-            v_row_bytes=self.mem_pool_device.qk_rope_head_dim * self.mem_pool_device.dtype.itemsize,
-            max_context_len=self.req_to_host_pool.shape[1],
-            device_buffer_row_stride=self.req_to_device_buffer.shape[1],
-            padded_buffer_size=self.padded_buffer_size,
-            max_num_reqs=max_num_reqs,
-            top_k=self.top_k,
-        )
+        group = self._prefetch_groups.get(layer_id) if self.enable_prefetch else None
+        if group:
+            # IndexShare anchor: one group-scatter launch fills this layer's
+            # and all its skip layers' device buffers (they share the slot
+            # table produced by the LRU/SIEVE call above).
+            self._lru_npu.scatter_from_host_group_npu(
+                host_kv_cache_ptr=self.host_kv_cache_base_ptr,
+                topk_indices=top_k_tokens,
+                top_k_device_slots=self.top_k_device_slots,
+                is_miss=self.is_miss,
+                req_pool_indices=req_pool_indices,
+                req_to_host_pool=self.req_to_host_pool,
+                req_to_device_buffer=self.req_to_device_buffer,
+                device_k_buffer=self.mem_pool_device.k_buffer,
+                device_v_buffer=self.mem_pool_device.v_buffer,
+                anchor_layer_id=layer_id,
+                group_size=1 + len(group),
+                host_entries=self.mem_pool_host.host_entries,
+                k_row_bytes=self.mem_pool_device.kv_lora_rank * self.mem_pool_device.dtype.itemsize,
+                v_row_bytes=self.mem_pool_device.qk_rope_head_dim * self.mem_pool_device.dtype.itemsize,
+                max_context_len=self.req_to_host_pool.shape[1],
+                device_buffer_row_stride=self.req_to_device_buffer.shape[1],
+                padded_buffer_size=self.padded_buffer_size,
+                max_num_reqs=max_num_reqs,
+                top_k=self.top_k,
+            )
+        else:
+            self._lru_npu.scatter_from_host_npu(
+                host_kv_cache_ptr=self.host_kv_cache_base_ptr,
+                topk_indices=top_k_tokens,
+                top_k_device_slots=self.top_k_device_slots,
+                is_miss=self.is_miss,
+                req_pool_indices=req_pool_indices,
+                req_to_host_pool=self.req_to_host_pool,
+                req_to_device_buffer=self.req_to_device_buffer,
+                device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
+                device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
+                layer_id=layer_id,
+                host_entries=self.mem_pool_host.host_entries,
+                k_row_bytes=self.mem_pool_device.kv_lora_rank * self.mem_pool_device.dtype.itemsize,
+                v_row_bytes=self.mem_pool_device.qk_rope_head_dim * self.mem_pool_device.dtype.itemsize,
+                max_context_len=self.req_to_host_pool.shape[1],
+                device_buffer_row_stride=self.req_to_device_buffer.shape[1],
+                padded_buffer_size=self.padded_buffer_size,
+                max_num_reqs=max_num_reqs,
+                top_k=self.top_k,
+            )
         if timed_layer:
             ev_scatter_end.record()
 
@@ -1708,7 +1795,7 @@ class HiSparseCoordinator:
             self._miss_per_req_accum[:max_num_reqs] += self.is_miss[
                 :max_num_reqs
             ].sum(dim=1)
-            if layer_id == self._layer_num - 1:
+            if layer_id == self._last_swap_layer:
                 self._stats_steps += 1
                 if self._stats_steps % self._miss_stats_interval == 0:
                     if self._stats_rank0:
@@ -1722,7 +1809,9 @@ class HiSparseCoordinator:
         self, batch_size: int, layer_id: int, req_pool_indices: torch.Tensor
     ) -> None:
         interval = self._miss_stats_interval
-        layers = self._layer_num * interval
+        # Skip layers accumulate no stats (they early-return before the
+        # LRU/scatter), so denominators count swap-in layers only.
+        layers = self._swap_layer_count * interval
         total_miss = int(self._miss_rows_accum.item())
         denom = batch_size * self.top_k * layers
         miss_rate = total_miss / denom * 100 if denom > 0 else 0.0
@@ -1748,12 +1837,12 @@ class HiSparseCoordinator:
         lru_ms_per_step = (
             sum(ev[0].elapsed_time(ev[1]) for ev in self._timing_events)
             / interval
-            * self._layer_num
+            * self._swap_layer_count
         )
         scatter_ms_per_step = (
             sum(ev[1].elapsed_time(ev[2]) for ev in self._timing_events)
             / interval
-            * self._layer_num
+            * self._swap_layer_count
         )
         scatter_bw = (
             scatter_mb_per_step / scatter_ms_per_step

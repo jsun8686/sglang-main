@@ -96,6 +96,33 @@ extern "C" void launch_hisparse_scatter_from_host(
     int32_t host_pool_rows,
     int32_t device_pool_rows);
 
+extern "C" void launch_hisparse_scatter_from_host_group(
+    uint32_t blockDim,
+    void* stream,
+    void* host_kv_cache,
+    void* topk_indices,
+    void* top_k_device_slots,
+    void* is_miss,
+    void* req_pool_indices,
+    void* req_to_host_pool,
+    void* req_to_device_buffer,
+    void* device_k_buffer,
+    void* device_v_buffer,
+    int32_t anchor_layer_id,
+    int32_t group_size,
+    int32_t host_entries,
+    int32_t k_row_bytes,
+    int32_t v_row_bytes,
+    int32_t max_context_len,
+    int32_t device_buffer_row_stride,
+    int32_t padded_buffer_size,
+    int32_t max_num_reqs,
+    int32_t top_k,
+    int32_t positions_per_core,
+    int32_t host_pool_rows,
+    int32_t device_layer_row_count,
+    int32_t device_layer_num);
+
 namespace {
 
 static inline void* get_npu_stream() {
@@ -484,6 +511,113 @@ void scatter_from_host(
         static_cast<int32_t>(device_k_buffer.size(0)));
 }
 
+void scatter_from_host_group(
+    int64_t host_kv_cache_ptr,
+    torch::Tensor topk_indices,
+    torch::Tensor top_k_device_slots,
+    torch::Tensor is_miss,
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_host_pool,
+    torch::Tensor req_to_device_buffer,
+    torch::Tensor device_k_buffer,
+    torch::Tensor device_v_buffer,
+    int64_t anchor_layer_id,
+    int64_t group_size,
+    int64_t host_entries,
+    int64_t k_row_bytes,
+    int64_t v_row_bytes,
+    int64_t max_context_len,
+    int64_t device_buffer_row_stride,
+    int64_t padded_buffer_size,
+    int64_t max_num_reqs,
+    int64_t top_k,
+    int64_t block_dim)
+{
+    check_tensor(topk_indices, "topk_indices");
+    check_tensor(top_k_device_slots, "top_k_device_slots");
+    check_tensor(is_miss, "is_miss");
+    check_tensor(req_pool_indices, "req_pool_indices");
+    check_tensor(req_to_host_pool, "req_to_host_pool");
+    check_tensor(req_to_device_buffer, "req_to_device_buffer");
+    check_tensor(device_k_buffer, "device_k_buffer");
+    check_tensor(device_v_buffer, "device_v_buffer");
+
+    if (block_dim <= 0) {
+        throw std::runtime_error("scatter_from_host_group: block_dim must be > 0");
+    }
+
+    if (k_row_bytes <= 0 || v_row_bytes <= 0) {
+        throw std::runtime_error("scatter_from_host_group: k_row_bytes and v_row_bytes must be > 0");
+    }
+    if (k_row_bytes % 32 != 0 || v_row_bytes % 32 != 0) {
+        throw std::runtime_error(
+            "scatter_from_host_group: k_row_bytes and v_row_bytes must be multiples of 32 bytes");
+    }
+    if (device_buffer_row_stride < padded_buffer_size) {
+        throw std::runtime_error(
+            "scatter_from_host_group: device_buffer_row_stride must be >= padded_buffer_size");
+    }
+
+    // device_k_buffer / device_v_buffer are the FULL layer-stacked pools.
+    const int64_t layer_num = device_k_buffer.size(0);
+    if (layer_num != device_v_buffer.size(0)) {
+        throw std::runtime_error(
+            "scatter_from_host_group: device_k_buffer and device_v_buffer layer counts differ");
+    }
+    if (anchor_layer_id < 0 || anchor_layer_id >= layer_num) {
+        throw std::runtime_error("scatter_from_host_group: anchor_layer_id out of range");
+    }
+    if (group_size < 1 || anchor_layer_id + group_size > layer_num) {
+        throw std::runtime_error("scatter_from_host_group: group exceeds the layer range");
+    }
+
+    // Flattened token rows per layer (page dims collapse into the row space).
+    const int64_t k_layer_elems = device_k_buffer.numel() / layer_num;
+    const int64_t v_layer_elems = device_v_buffer.numel() / layer_num;
+    const int64_t k_row_count = k_layer_elems / device_k_buffer.size(-1);
+    const int64_t v_row_count = v_layer_elems / device_v_buffer.size(-1);
+    if (k_row_count != v_row_count || k_row_count <= 0) {
+        throw std::runtime_error(
+            "scatter_from_host_group: per-layer row counts inconsistent or empty");
+    }
+    if (k_row_count > INT32_MAX) {
+        throw std::runtime_error("scatter_from_host_group: per-layer row count exceeds int32");
+    }
+
+    int64_t total_positions = max_num_reqs * top_k;
+    int64_t positions_per_core = (total_positions + block_dim - 1) / block_dim;
+    if (positions_per_core < 1) {
+        positions_per_core = 1;
+    }
+
+    launch_hisparse_scatter_from_host_group(
+        static_cast<uint32_t>(block_dim),
+        get_npu_stream(),
+        reinterpret_cast<void*>(host_kv_cache_ptr),
+        topk_indices.data_ptr(),
+        top_k_device_slots.data_ptr(),
+        is_miss.data_ptr(),
+        req_pool_indices.data_ptr(),
+        req_to_host_pool.data_ptr(),
+        req_to_device_buffer.data_ptr(),
+        device_k_buffer.data_ptr(),
+        device_v_buffer.data_ptr(),
+        static_cast<int32_t>(anchor_layer_id),
+        static_cast<int32_t>(group_size),
+        static_cast<int32_t>(host_entries),
+        static_cast<int32_t>(k_row_bytes),
+        static_cast<int32_t>(v_row_bytes),
+        static_cast<int32_t>(max_context_len),
+        static_cast<int32_t>(device_buffer_row_stride),
+        static_cast<int32_t>(padded_buffer_size),
+        static_cast<int32_t>(max_num_reqs),
+        static_cast<int32_t>(top_k),
+        static_cast<int32_t>(positions_per_core),
+        static_cast<int32_t>(req_to_host_pool.size(0)),
+        static_cast<int32_t>(k_row_count),
+        static_cast<int32_t>(layer_num));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "HiSparse NPU graph-compatible kernels";
     m.def("lru_update", &lru_update,
@@ -494,4 +628,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Build/rebuild the persistent SIEVE hash table for a request range");
     m.def("scatter_from_host", &scatter_from_host,
           "Scatter missing KV rows from host cache to device buffer");
+    m.def("scatter_from_host_group", &scatter_from_host_group,
+          "Scatter missing KV rows for an anchor layer and its shared-index group");
 }

@@ -668,6 +668,146 @@ extern "C" __global__ __aicore__ void hisparse_sieve_update(
     }
 }
 
+extern "C" __global__ __aicore__ void hisparse_scatter_from_host_group(
+    GM_ADDR host_kv_cache,
+    GM_ADDR topk_indices,
+    GM_ADDR top_k_device_slots,
+    GM_ADDR is_miss,
+    GM_ADDR req_pool_indices,
+    GM_ADDR req_to_host_pool,
+    GM_ADDR req_to_device_buffer,
+    GM_ADDR device_k_buffer,
+    GM_ADDR device_v_buffer,
+    int32_t anchor_layer_id,
+    int32_t group_size,
+    int32_t host_entries,
+    int32_t k_row_bytes,
+    int32_t v_row_bytes,
+    int32_t max_context_len,
+    int32_t device_buffer_row_stride,
+    int32_t padded_buffer_size,
+    int32_t max_num_reqs,
+    int32_t top_k,
+    int32_t positions_per_core,
+    int32_t host_pool_rows,
+    int32_t device_layer_row_count,
+    int32_t device_layer_num)
+{
+    // IndexShare group variant: the anchor layer's scatter also fills its
+    // trailing shared-index (skip) layers' device buffers.  Every layer in
+    // the group queries the same top-k indices, so the anchor's LRU/SIEVE
+    // slot table is valid for all of them (lockstep layout: admission
+    // initializes and finish/abort clears all layers identically, and only
+    // the anchor ever mutates the shared slot table).  Skip layers therefore
+    // never launch their own LRU/scatter kernels.
+    //
+    // device_k_buffer / device_v_buffer are the FULL layer-stacked pools:
+    // layer L's rows start at L * device_layer_row_count (flattened token
+    // rows).  The host pool keeps the legacy layer-major layout here (one
+    // host_kv_row DMA per (miss, layer)); the entry-major layout flips this
+    // to a single contiguous group read.
+    int32_t total_positions = max_num_reqs * top_k;
+    int32_t block_idx = GetBlockIdx();
+    int32_t start_pos = block_idx * positions_per_core;
+    int32_t end_pos = start_pos + positions_per_core;
+    if (end_pos > total_positions) {
+        end_pos = total_positions;
+    }
+
+    int32_t kv_row_bytes = k_row_bytes + v_row_bytes;
+
+    TPipe pipe;
+    // Quad-buffered queues provide deeper pipeline overlap: while miss N
+    // is written back to device (MTE3), misses N+1..N+3 can already be
+    // fetched from host (MTE1).  Each slot holds a full K+V row so a single
+    // pipeline pass copies both.
+    TQue<QuePosition::VECIN, 4> inQue;
+    TQue<QuePosition::VECOUT, 4> outQue;
+    pipe.InitBuffer(inQue, 4, kv_row_bytes);
+    pipe.InitBuffer(outQue, 4, kv_row_bytes);
+
+    __gm__ int32_t* topk_ptr = reinterpret_cast<__gm__ int32_t*>(topk_indices);
+    __gm__ int32_t* slots_ptr = reinterpret_cast<__gm__ int32_t*>(top_k_device_slots);
+    __gm__ int8_t* is_miss_ptr = reinterpret_cast<__gm__ int8_t*>(is_miss);
+    __gm__ int64_t* req_pool_ptr = reinterpret_cast<__gm__ int64_t*>(req_pool_indices);
+    __gm__ int64_t* req_to_host_pool_ptr = reinterpret_cast<__gm__ int64_t*>(req_to_host_pool);
+    __gm__ int64_t* req_to_device_buffer_ptr = reinterpret_cast<__gm__ int64_t*>(req_to_device_buffer);
+    __gm__ uint8_t* host_kv_cache_ptr = reinterpret_cast<__gm__ uint8_t*>(host_kv_cache);
+    __gm__ uint8_t* k_base = reinterpret_cast<__gm__ uint8_t*>(device_k_buffer);
+    __gm__ uint8_t* v_base = reinterpret_cast<__gm__ uint8_t*>(device_v_buffer);
+
+    for (int32_t pos = start_pos; pos < end_pos; ++pos) {
+        int32_t bid = pos / top_k;
+        int32_t k = pos % top_k;
+        if (is_miss_ptr[pos] == 0) {
+            continue;
+        }
+
+        int64_t req_idx = req_pool_ptr[bid];
+        int32_t token_pos = topk_ptr[pos];
+        int32_t device_slot_in_buffer = slots_ptr[pos];
+
+        // Defensive: never address GM/host memory out of bounds on
+        // inconsistent state.
+        if (req_idx < 0 || req_idx >= host_pool_rows) {
+            continue;
+        }
+        if (token_pos < 0 || token_pos >= max_context_len) {
+            continue;
+        }
+        if (device_slot_in_buffer < 0 || device_slot_in_buffer >= device_buffer_row_stride) {
+            continue;
+        }
+
+        int64_t host_offset = req_to_host_pool_ptr[req_idx * max_context_len + token_pos];
+        if (host_offset < 0 || host_offset >= host_entries) {
+            continue;
+        }
+        int64_t device_offset = req_to_device_buffer_ptr[
+            req_idx * (int64_t)device_buffer_row_stride + device_slot_in_buffer];
+        if (device_offset < 0 || device_offset >= device_layer_row_count) {
+            continue;
+        }
+
+        for (int32_t g = 0; g < group_size; ++g) {
+            int32_t layer = anchor_layer_id + g;
+            if (layer < 0 || layer >= device_layer_num) {
+                break;
+            }
+
+            __gm__ uint8_t* host_kv_row = host_kv_cache_ptr
+                + ((int64_t)layer * host_entries + host_offset) * kv_row_bytes;
+
+            __gm__ uint8_t* device_k_row = k_base
+                + ((int64_t)layer * device_layer_row_count + device_offset) * k_row_bytes;
+            __gm__ uint8_t* device_v_row = v_base
+                + ((int64_t)layer * device_layer_row_count + device_offset) * v_row_bytes;
+
+            {
+                GlobalTensor<uint8_t> host_kv_gm, device_k_gm, device_v_gm;
+                host_kv_gm.SetGlobalBuffer(host_kv_row);
+                device_k_gm.SetGlobalBuffer(device_k_row);
+                device_v_gm.SetGlobalBuffer(device_v_row);
+
+                LocalTensor<uint8_t> local_kv = inQue.AllocTensor<uint8_t>();
+                DataCopy(local_kv, host_kv_gm, kv_row_bytes);
+                inQue.EnQue(local_kv);
+
+                LocalTensor<uint8_t> local_kv_deq = inQue.DeQue<uint8_t>();
+                LocalTensor<uint8_t> local_kv_out = outQue.AllocTensor<uint8_t>();
+                DataCopy(local_kv_out, local_kv_deq, kv_row_bytes);
+                outQue.EnQue(local_kv_out);
+                inQue.FreeTensor(local_kv_deq);
+
+                LocalTensor<uint8_t> local_kv_out_deq = outQue.DeQue<uint8_t>();
+                DataCopy(device_k_gm, local_kv_out_deq, k_row_bytes);
+                DataCopy(device_v_gm, local_kv_out_deq[k_row_bytes], v_row_bytes);
+                outQue.FreeTensor(local_kv_out_deq);
+            }
+        }
+    }
+}
+
 extern "C" __global__ __aicore__ void hisparse_scatter_from_host(
     GM_ADDR host_kv_cache,
     GM_ADDR topk_indices,
