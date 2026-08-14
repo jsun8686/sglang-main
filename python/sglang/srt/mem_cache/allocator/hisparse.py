@@ -181,6 +181,30 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # the middle; the rest is claimed fresh from the allocator.
             assert head_keep + tail_keep <= len(hisparse_indices)
             assert (head_keep + tail_keep) % self.page_size == 0
+            # Pad hisparse_indices to page-aligned length so the head/tail
+            # split doesn't create a page straddling the middle/tail
+            # boundary.  Without this, a straddling page gets freed once
+            # here (middle-free) and again when the buffer is freed at
+            # request finish (_free_device_buffer_npu), because the NPU
+            # allocator's free() uses page-level unique() with no cross-
+            # call dedup.  The padded slots are the residual of the last
+            # page already allocated by alloc_extend — freeing them
+            # alongside the rest of the page is correct.
+            page_residual = len(hisparse_indices) % self.page_size
+            if page_residual != 0:
+                last_val = int(hisparse_indices[-1].item())
+                pad_count = self.page_size - page_residual
+                hisparse_indices = torch.cat(
+                    [
+                        hisparse_indices,
+                        torch.arange(
+                            last_val + 1,
+                            last_val + 1 + pad_count,
+                            dtype=hisparse_indices.dtype,
+                            device=self.device,
+                        ),
+                    ]
+                )
             tail_start = (
                 len(hisparse_indices) - tail_keep
                 if tail_keep > 0
