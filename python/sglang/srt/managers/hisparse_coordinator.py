@@ -28,6 +28,8 @@ from sglang.srt.utils import get_device_module, is_hip, is_npu
 
 device_module = get_device_module()
 
+_hisparse_free_debug = os.environ.get("HISPARSE_FREE_DEBUG", "0") == "1"
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 
@@ -1152,6 +1154,13 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
+        if _hisparse_free_debug:
+            logging.warning(
+                "[HiSparseFinish] req_idx=%d is_npu=%s kv_allocated_len=%d",
+                req.req_pool_idx,
+                self.is_npu,
+                req.kv.kv_allocated_len if req.kv else -1,
+            )
         if self.is_npu:
             self._request_finished_npu(req)
             return
@@ -1445,9 +1454,47 @@ class HiSparseCoordinator:
             )
             self.req_decode_buffer_capacity[req_idx] = 0
         if parts:
-            self.token_to_kv_pool_allocator.free_hisparse_indices(torch.cat(parts))
+            all_buf = torch.cat(parts)
+            valid_buf = all_buf[all_buf > 0]
+            if _hisparse_free_debug:
+                ha = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+                unique_pages = (
+                    torch.unique(valid_buf.cpu() // ha.page_size)
+                    if valid_buf.numel() > 0
+                    else torch.tensor([], dtype=torch.int64)
+                )
+                logging.warning(
+                    "[HiSparseFreeBuf] req_idx=%d current_cap=%d decode_cap=%d "
+                    "valid_slots=%d unique_pages=%d "
+                    "ha_free_pages_before=%d ha_avail_before=%d ha_size=%d",
+                    req_idx,
+                    current_cap,
+                    decode_cap,
+                    valid_buf.numel(),
+                    len(unique_pages),
+                    len(ha.free_pages),
+                    ha.available_size(),
+                    ha.size,
+                )
+            self.token_to_kv_pool_allocator.free_hisparse_indices(valid_buf)
+            if _hisparse_free_debug:
+                ha = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+                logging.warning(
+                    "[HiSparseFreeBuf] req_idx=%d ha_free_pages_after=%d "
+                    "ha_avail_after=%d overflow=%s",
+                    req_idx,
+                    len(ha.free_pages),
+                    ha.available_size(),
+                    ha.available_size() > ha.size,
+                )
 
     def _abort_staging_request_npu(self, req: Req) -> None:
+        if _hisparse_free_debug:
+            logging.warning(
+                "[HiSparseAbortNpu] req_idx=%d prefill_len=%d",
+                req.req_pool_idx,
+                req.extend_range.end,
+            )
         self._free_device_buffer_npu(req.req_pool_idx)
 
         prefill_len = req.extend_range.end
@@ -1475,6 +1522,12 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
 
     def _request_finished_npu(self, req: Req):
+        if _hisparse_free_debug:
+            logging.warning(
+                "[HiSparseFinishNpu] req_idx=%d kv_allocated_len=%d",
+                req.req_pool_idx,
+                req.kv.kv_allocated_len,
+            )
         self._free_device_buffer_npu(req.req_pool_idx)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
@@ -1526,6 +1579,12 @@ class HiSparseCoordinator:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 out_cache_loc.to(torch.int64)
             ] = new_slots.to(torch.int64)
+            if _hisparse_free_debug:
+                logging.warning(
+                    "[HiSparseDecodeSlot] page_size=1 bs=%d ha_avail_after=%d",
+                    bs,
+                    allocator.available_size(),
+                )
             return
 
         needs_alloc = decode_offsets % page_size == 0
