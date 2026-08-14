@@ -449,6 +449,18 @@ class AscendAttnBackend(AttentionBackend):
             self.token_to_kv_pool, "full_to_hisparse_device_index_mapping"
         )
         if is_hisparse:
+            logical_indices = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :seq_lens_max
+            ]
+            # HiSparse: the indexer uses a logical page table over the full
+            # sequence, while the attention kernel uses a physical page table
+            # into k_buffer/v_buffer.
+            self.forward_metadata.block_tables_index = (
+                logical_indices[:, :: self.page_size] // self.page_size
+            ).to(torch.int32).contiguous()
+            self.forward_metadata.actual_seq_lengths_kv_index = (
+                forward_batch.seq_lens.int()
+            )
             coordinator = getattr(forward_batch, "hisparse_coordinator", None)
             if (
                 forward_batch.forward_mode.is_decode()
@@ -465,9 +477,6 @@ class AscendAttnBackend(AttentionBackend):
                 ).to(torch.int32).contiguous()
             else:
                 # HiSparse prefill: map logical positions to physical pages
-                logical_indices = self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, :seq_lens_max
-                ]
                 physical_indices = (
                     self.token_to_kv_pool.full_to_hisparse_device_index_mapping[
                         logical_indices
