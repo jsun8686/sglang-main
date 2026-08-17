@@ -94,7 +94,9 @@ extern "C" void launch_hisparse_scatter_from_host(
     int32_t top_k,
     int32_t positions_per_core,
     int32_t host_pool_rows,
-    int32_t device_pool_rows);
+    int32_t device_pool_rows,
+    int32_t host_entry_major,
+    int32_t host_num_layers);
 
 extern "C" void launch_hisparse_scatter_from_host_group(
     uint32_t blockDim,
@@ -121,7 +123,26 @@ extern "C" void launch_hisparse_scatter_from_host_group(
     int32_t positions_per_core,
     int32_t host_pool_rows,
     int32_t device_layer_row_count,
-    int32_t device_layer_num);
+    int32_t device_layer_num,
+    int32_t host_entry_major,
+    int32_t host_num_layers);
+
+extern "C" void launch_hisparse_backup_to_host(
+    uint32_t blockDim,
+    void* stream,
+    void* device_k_buffer,
+    void* device_v_buffer,
+    void* host_kv_cache,
+    void* host_indices,
+    void* device_indices,
+    int32_t num_tokens,
+    int32_t host_entries,
+    int32_t host_num_layers,
+    int32_t device_layer_row_count,
+    int32_t device_layer_num,
+    int32_t k_row_bytes,
+    int32_t v_row_bytes,
+    int32_t tokens_per_core);
 
 namespace {
 
@@ -452,6 +473,8 @@ void scatter_from_host(
     int64_t padded_buffer_size,
     int64_t max_num_reqs,
     int64_t top_k,
+    int64_t host_entry_major,
+    int64_t host_num_layers,
     int64_t block_dim)
 {
     check_tensor(topk_indices, "topk_indices");
@@ -477,6 +500,9 @@ void scatter_from_host(
     if (device_buffer_row_stride < padded_buffer_size) {
         throw std::runtime_error(
             "scatter_from_host: device_buffer_row_stride must be >= padded_buffer_size");
+    }
+    if (host_num_layers <= 0) {
+        throw std::runtime_error("scatter_from_host: host_num_layers must be > 0");
     }
 
     int64_t total_positions = max_num_reqs * top_k;
@@ -508,7 +534,9 @@ void scatter_from_host(
         static_cast<int32_t>(top_k),
         static_cast<int32_t>(positions_per_core),
         static_cast<int32_t>(req_to_host_pool.size(0)),
-        static_cast<int32_t>(device_k_buffer.size(0)));
+        static_cast<int32_t>(device_k_buffer.size(0)),
+        static_cast<int32_t>(host_entry_major ? 1 : 0),
+        static_cast<int32_t>(host_num_layers));
 }
 
 void scatter_from_host_group(
@@ -531,6 +559,8 @@ void scatter_from_host_group(
     int64_t padded_buffer_size,
     int64_t max_num_reqs,
     int64_t top_k,
+    int64_t host_entry_major,
+    int64_t host_num_layers,
     int64_t block_dim)
 {
     check_tensor(topk_indices, "topk_indices");
@@ -557,6 +587,9 @@ void scatter_from_host_group(
         throw std::runtime_error(
             "scatter_from_host_group: device_buffer_row_stride must be >= padded_buffer_size");
     }
+    if (host_num_layers <= 0) {
+        throw std::runtime_error("scatter_from_host_group: host_num_layers must be > 0");
+    }
 
     // device_k_buffer / device_v_buffer are the FULL layer-stacked pools.
     const int64_t layer_num = device_k_buffer.size(0);
@@ -569,6 +602,10 @@ void scatter_from_host_group(
     }
     if (group_size < 1 || anchor_layer_id + group_size > layer_num) {
         throw std::runtime_error("scatter_from_host_group: group exceeds the layer range");
+    }
+    if (host_entry_major && host_num_layers != layer_num) {
+        throw std::runtime_error(
+            "scatter_from_host_group: entry-major host pool layer count mismatch");
     }
 
     // Flattened token rows per layer (page dims collapse into the row space).
@@ -615,7 +652,93 @@ void scatter_from_host_group(
         static_cast<int32_t>(positions_per_core),
         static_cast<int32_t>(req_to_host_pool.size(0)),
         static_cast<int32_t>(k_row_count),
-        static_cast<int32_t>(layer_num));
+        static_cast<int32_t>(layer_num),
+        static_cast<int32_t>(host_entry_major ? 1 : 0),
+        static_cast<int32_t>(host_num_layers));
+}
+
+void backup_to_host(
+    torch::Tensor device_k_buffer,
+    torch::Tensor device_v_buffer,
+    int64_t host_kv_cache_ptr,
+    torch::Tensor host_indices,
+    torch::Tensor device_indices,
+    int64_t host_entries,
+    int64_t host_num_layers,
+    int64_t k_row_bytes,
+    int64_t v_row_bytes,
+    int64_t num_tokens,
+    int64_t block_dim)
+{
+    check_tensor(device_k_buffer, "device_k_buffer");
+    check_tensor(device_v_buffer, "device_v_buffer");
+    check_tensor(host_indices, "host_indices");
+    check_tensor(device_indices, "device_indices");
+
+    if (block_dim <= 0) {
+        throw std::runtime_error("backup_to_host: block_dim must be > 0");
+    }
+    if (k_row_bytes <= 0 || v_row_bytes <= 0) {
+        throw std::runtime_error("backup_to_host: k_row_bytes and v_row_bytes must be > 0");
+    }
+    if (k_row_bytes % 32 != 0 || v_row_bytes % 32 != 0) {
+        throw std::runtime_error(
+            "backup_to_host: k_row_bytes and v_row_bytes must be multiples of 32 bytes");
+    }
+    if (num_tokens <= 0) {
+        throw std::runtime_error("backup_to_host: num_tokens must be > 0");
+    }
+    if (host_indices.numel() != num_tokens || device_indices.numel() != num_tokens) {
+        throw std::runtime_error("backup_to_host: index tensor lengths must equal num_tokens");
+    }
+    if (host_indices.scalar_type() != torch::kInt64 ||
+        device_indices.scalar_type() != torch::kInt64) {
+        throw std::runtime_error("backup_to_host: index tensors must be int64");
+    }
+
+    const int64_t layer_num = device_k_buffer.size(0);
+    if (layer_num != device_v_buffer.size(0)) {
+        throw std::runtime_error(
+            "backup_to_host: device_k_buffer and device_v_buffer layer counts differ");
+    }
+    if (host_num_layers != layer_num) {
+        throw std::runtime_error("backup_to_host: host pool layer count mismatch");
+    }
+
+    // Flattened token rows per layer (page dims collapse into the row space).
+    const int64_t k_layer_elems = device_k_buffer.numel() / layer_num;
+    const int64_t v_layer_elems = device_v_buffer.numel() / layer_num;
+    const int64_t k_row_count = k_layer_elems / device_k_buffer.size(-1);
+    const int64_t v_row_count = v_layer_elems / device_v_buffer.size(-1);
+    if (k_row_count != v_row_count || k_row_count <= 0) {
+        throw std::runtime_error(
+            "backup_to_host: per-layer row counts inconsistent or empty");
+    }
+    if (k_row_count > INT32_MAX) {
+        throw std::runtime_error("backup_to_host: per-layer row count exceeds int32");
+    }
+
+    int64_t tokens_per_core = (num_tokens + block_dim - 1) / block_dim;
+    if (tokens_per_core < 1) {
+        tokens_per_core = 1;
+    }
+
+    launch_hisparse_backup_to_host(
+        static_cast<uint32_t>(block_dim),
+        get_npu_stream(),
+        device_k_buffer.data_ptr(),
+        device_v_buffer.data_ptr(),
+        reinterpret_cast<void*>(host_kv_cache_ptr),
+        host_indices.data_ptr(),
+        device_indices.data_ptr(),
+        static_cast<int32_t>(num_tokens),
+        static_cast<int32_t>(host_entries),
+        static_cast<int32_t>(host_num_layers),
+        static_cast<int32_t>(k_row_count),
+        static_cast<int32_t>(layer_num),
+        static_cast<int32_t>(k_row_bytes),
+        static_cast<int32_t>(v_row_bytes),
+        static_cast<int32_t>(tokens_per_core));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -630,4 +753,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Scatter missing KV rows from host cache to device buffer");
     m.def("scatter_from_host_group", &scatter_from_host_group,
           "Scatter missing KV rows for an anchor layer and its shared-index group");
+    m.def("backup_to_host", &backup_to_host,
+          "Backup full-layer KV rows from device pool to entry-major host pool");
 }

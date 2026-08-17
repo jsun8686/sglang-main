@@ -1762,6 +1762,8 @@ class HiSparseCoordinator:
                 padded_buffer_size=self.padded_buffer_size,
                 max_num_reqs=max_num_reqs,
                 top_k=self.top_k,
+                host_entry_major=self.mem_pool_host.entry_major,
+                host_num_layers=self.mem_pool_host.num_layers,
             )
         else:
             self._lru_npu.scatter_from_host_npu(
@@ -1783,6 +1785,8 @@ class HiSparseCoordinator:
                 padded_buffer_size=self.padded_buffer_size,
                 max_num_reqs=max_num_reqs,
                 top_k=self.top_k,
+                host_entry_major=self.mem_pool_host.entry_major,
+                host_num_layers=self.mem_pool_host.num_layers,
             )
         if timed_layer:
             ev_scatter_end.record()
