@@ -350,6 +350,16 @@ class HiSparseCoordinator:
         self.req_prefill_len = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+        # CPU mirror of req_prefill_len: the scheduler-side decode
+        # bookkeeping (alloc_decode_buffer_slot) reads prefill lengths from
+        # CPU to avoid per-step device gathers and .item() syncs.  All
+        # writes go through _set_req_prefill_len to keep the two in sync.
+        self.req_prefill_len_cpu = torch.zeros(
+            max_num_reqs, dtype=torch.int64, device="cpu"
+        )
+        # Cached CPU arange for decode page-slot column construction; sized
+        # to the hisparse allocator page size on first use.
+        self._page_arange_cpu = None
         self.req_decode_buffer_capacity = torch.zeros(
             max_num_reqs, dtype=torch.int64, device=device
         )
@@ -921,6 +931,14 @@ class HiSparseCoordinator:
             ready_reqs.append(req)
         return ready_reqs
 
+    def _set_req_prefill_len(self, req_pool_idx: int, value: int) -> None:
+        """Write the per-request prefill length to the device copy (consumed
+        by the LRU/SIEVE kernels) and the CPU mirror (consumed by the
+        scheduler-side decode bookkeeping) atomically from the caller's
+        perspective."""
+        self.req_prefill_len[req_pool_idx] = value
+        self.req_prefill_len_cpu[req_pool_idx] = value
+
     def map_last_loc_to_buffer(
         self,
         seq_lens: torch.Tensor,
@@ -931,7 +949,11 @@ class HiSparseCoordinator:
     ) -> None:
         if self.is_npu:
             self.alloc_decode_buffer_slot(
-                seq_lens, out_cache_loc, req_pool_indices
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
             )
             return
         self._eager_backup_previous_token(
@@ -1410,7 +1432,7 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        self.req_prefill_len[req.req_pool_idx] = prefill_len
+        self._set_req_prefill_len(req.req_pool_idx, prefill_len)
         aligned_prefill_len = self._aligned_size(prefill_len)
         host_indices = self.mem_pool_host.alloc(aligned_prefill_len)
         if host_indices is None:
@@ -1542,7 +1564,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_prefill_len[req.req_pool_idx] = 0
+        self._set_req_prefill_len(req.req_pool_idx, 0)
         self.req_decode_buffer_capacity[req.req_pool_idx] = 0
         self.device_buffer_tokens[:, req.req_pool_idx, :] = -1
         if self._eviction_algo == "lru":
@@ -1567,7 +1589,7 @@ class HiSparseCoordinator:
         self.req_host_allocated_len[req.req_pool_idx] = 0
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_prefill_len[req.req_pool_idx] = 0
+        self._set_req_prefill_len(req.req_pool_idx, 0)
         self.req_decode_buffer_capacity[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.device_buffer_tokens[:, req.req_pool_idx, :] = -1
@@ -1580,31 +1602,50 @@ class HiSparseCoordinator:
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        """Allocate decode-extension slots on-demand and map out_cache_loc."""
+        """Allocate decode-extension slots on-demand and map out_cache_loc.
+
+        All bookkeeping math (decode offsets, page-boundary detection,
+        capacity alignment, scatter index construction) runs on CPU
+        mirrors, so a decode step pays no device synchronization and no
+        small-op launch storm here; only the scatter writes touch the
+        device (one gather of the mapped slots plus, on page-boundary
+        steps, one bulk page-slot write)."""
         bs = req_pool_indices.shape[0]
         if self.max_decode_len <= 0 or bs == 0:
             return
 
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         page_size = allocator.page_size
-        prefill_len = self.req_prefill_len[req_pool_indices]
-        decode_offsets = seq_lens.to(torch.int64) - 1 - prefill_len.to(torch.int64)
+        decode_offsets = (
+            seq_lens_cpu.to(torch.int64)
+            - 1
+            - self.req_prefill_len_cpu[req_pool_indices_cpu]
+        )
+        out_loc = (
+            out_cache_loc
+            if out_cache_loc.dtype == torch.int64
+            else out_cache_loc.to(torch.int64)
+        )
 
         if page_size == 1:
             new_slots = allocator.alloc(bs)
             if new_slots is None:
                 raise RuntimeError("HiSparse decode buffer alloc returned None")
-            col_indices = self.padded_buffer_size + decode_offsets
+            col_indices = (self.padded_buffer_size + decode_offsets).to(self.device)
             self.req_to_device_buffer[req_pool_indices, col_indices] = new_slots
-            self.req_decode_buffer_capacity[req_pool_indices] = decode_offsets + 1
+            self.req_decode_buffer_capacity[req_pool_indices_cpu] = (
+                decode_offsets + 1
+            )
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                out_cache_loc.to(torch.int64)
+                out_loc
             ] = new_slots.to(torch.int64)
             return
 
         needs_alloc = decode_offsets % page_size == 0
-        num_new = int(needs_alloc.sum().item())
+        num_new = int(needs_alloc.sum())
         if num_new > 0:
             total_slots = num_new * page_size
             page_slots = allocator.alloc(total_slots)
@@ -1613,27 +1654,29 @@ class HiSparseCoordinator:
                     f"HiSparse decode buffer alloc returned None (requested {total_slots})"
                 )
             page_slots = page_slots.view(num_new, page_size)
-            boundary_reqs = req_pool_indices[needs_alloc]
-            boundary_offsets = decode_offsets[needs_alloc]
-            col_base = self.padded_buffer_size + boundary_offsets
-            cols = (
-                col_base.unsqueeze(1)
-                + torch.arange(page_size, device=self.device).unsqueeze(0)
+            col_base = self.padded_buffer_size + decode_offsets[needs_alloc]
+            page_arange = self._page_arange_cpu
+            if page_arange is None or page_arange.numel() != page_size:
+                page_arange = torch.arange(page_size, dtype=torch.int64)
+                self._page_arange_cpu = page_arange
+            cols_cpu = col_base.unsqueeze(1) + page_arange.unsqueeze(0)
+            rows_cpu = req_pool_indices_cpu[needs_alloc].unsqueeze(1).expand(
+                -1, page_size
             )
             self.req_to_device_buffer[
-                boundary_reqs.unsqueeze(1).expand(-1, page_size), cols
+                rows_cpu.to(self.device), cols_cpu.to(self.device)
             ] = page_slots
 
         device_indices = self.req_to_device_buffer[
             req_pool_indices,
-            self.padded_buffer_size + decode_offsets,
+            (self.padded_buffer_size + decode_offsets).to(self.device),
         ]
         raw_cap = decode_offsets + 1
         page_aligned_cap = (raw_cap + page_size - 1) // page_size * page_size
-        self.req_decode_buffer_capacity[req_pool_indices] = page_aligned_cap
+        self.req_decode_buffer_capacity[req_pool_indices_cpu] = page_aligned_cap
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
-            out_cache_loc.to(torch.int64)
-        ] = device_indices.to(torch.int64)
+            out_loc
+        ] = device_indices
 
     def get_front_topk_tokens(
         self,
