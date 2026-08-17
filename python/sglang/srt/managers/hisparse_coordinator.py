@@ -442,6 +442,30 @@ class HiSparseCoordinator:
         self._bypass_swap_1 = os.environ.get("HISPARSE_BYPASS_SWAP_1", "0") == "1"
         self._bypass_swap_2 = os.environ.get("HISPARSE_BYPASS_SWAP_2", "0") == "1"
 
+        # Benchmark stub quality: HISPARSE_BYPASS_SPREAD=1 replaces the
+        # slot-0 fill of the bypass paths with a fixed pseudo-random spread
+        # over [0, device_buffer_size) so the attention gather reads a
+        # realistic row distribution (throughput ceiling measurement).
+        # HISPARSE_BYPASS_SPREAD_VARY=1 rotates the pattern by one slot per
+        # call via a device counter (also advances under NPU graph replay).
+        # Built eagerly here: a lazy H2D build inside the first decode
+        # forward would be captured by the NPU graph.
+        self._bypass_spread = os.environ.get("HISPARSE_BYPASS_SPREAD", "0") == "1"
+        self._bypass_spread_vary = (
+            os.environ.get("HISPARSE_BYPASS_SPREAD_VARY", "0") == "1"
+        )
+        self._bypass_spread_slots = None
+        self._bypass_spread_off = None
+        if self._bypass_spread:
+            self._init_bypass_spread_slots()
+            self._bypass_spread_off = torch.zeros(1, dtype=torch.int32, device=device)
+            logger.info(
+                "HiSparse NPU: bypass spread stub enabled (vary=%s), slots "
+                "spread over [0, %d)",
+                self._bypass_spread_vary,
+                self.device_buffer_size,
+            )
+
         # Lightweight miss-rate statistics
         self._miss_stats_on = os.environ.get("HISPARSE_MISS_STATS", "0") == "1"
         self._miss_stats_interval = int(
@@ -1624,6 +1648,51 @@ class HiSparseCoordinator:
         top_k_indices[mask] = -1
         return top_k_indices
 
+    def _init_bypass_spread_slots(self) -> None:
+        """Benchmark-only: build the fixed pseudo-random slot table used by
+        the bypass spread stub.  Each request row gets its own distinct slot
+        permutation (fixed CPU seed, reproducible); values stay within
+        [0, device_buffer_size) so every downstream translation path is
+        in-bounds."""
+        dbs = self.device_buffer_size
+        num_rows = self.req_to_device_buffer.shape[0]
+        gen = torch.Generator(device="cpu").manual_seed(20260817)
+        rows = []
+        for _ in range(num_rows):
+            if self.top_k <= dbs:
+                rows.append(
+                    torch.randperm(dbs, generator=gen, dtype=torch.int32)[
+                        : self.top_k
+                    ]
+                )
+            else:
+                rows.append(
+                    torch.randint(
+                        0, dbs, (self.top_k,), generator=gen, dtype=torch.int32
+                    )
+                )
+        self._bypass_spread_slots = torch.stack(rows).contiguous().to(self.device)
+
+    def _fill_bypass_slots(
+        self,
+        slots: torch.Tensor,
+        top_k_tokens: torch.Tensor,
+        num_real: int,
+    ) -> None:
+        """Overwrite the live ``top_k_device_slots`` rows with the spread
+        stub, preserving the -1 padding semantics for invalid tokens.  With
+        VARY enabled the pattern rotates by one slot per call (int32 device
+        counter, so the rotation also advances under NPU graph replay)."""
+        if self._bypass_spread_vary:
+            self._bypass_spread_off.add_(1)
+            slots.copy_(
+                (self._bypass_spread_slots[:num_real] + self._bypass_spread_off)
+                % self.device_buffer_size
+            )
+        else:
+            slots.copy_(self._bypass_spread_slots[:num_real])
+        slots.masked_fill_(top_k_tokens == -1, -1)
+
     def _swap_in_selected_pages_npu(
         self,
         req_pool_indices: torch.Tensor,
@@ -1646,8 +1715,11 @@ class HiSparseCoordinator:
 
         if self._bypass_swap:
             slots = self.top_k_device_slots[:num_real]
-            slots.fill_(0)
-            slots.masked_fill_(top_k_result == -1, -1)
+            if self._bypass_spread:
+                self._fill_bypass_slots(slots, top_k_result, num_real)
+            else:
+                slots.fill_(0)
+                slots.masked_fill_(top_k_result == -1, -1)
             return slots.view(num_real, 1, -1)
 
         # IndexShare skip layer: reuse the anchor's swap-in results.  Same
@@ -1733,8 +1805,11 @@ class HiSparseCoordinator:
         if self._bypass_swap_1:
             num_real = req_pool_indices.shape[0]
             slots = self.top_k_device_slots[:num_real]
-            slots.fill_(0)
-            slots.masked_fill_(top_k_tokens == -1, -1)
+            if self._bypass_spread:
+                self._fill_bypass_slots(slots, top_k_tokens, num_real)
+            else:
+                slots.fill_(0)
+                slots.masked_fill_(top_k_tokens == -1, -1)
             return
 
         group = self._prefetch_groups.get(layer_id) if self.enable_prefetch else None
