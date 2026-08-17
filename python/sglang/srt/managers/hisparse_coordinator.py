@@ -11,6 +11,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
+from sglang.kernels.ops.memory.allocator import hisparse_decode_slot_kernel
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
@@ -451,6 +452,11 @@ class HiSparseCoordinator:
         self._bypass_swap = os.environ.get("HISPARSE_BYPASS_SWAP", "0") == "1"
         self._bypass_swap_1 = os.environ.get("HISPARSE_BYPASS_SWAP_1", "0") == "1"
         self._bypass_swap_2 = os.environ.get("HISPARSE_BYPASS_SWAP_2", "0") == "1"
+
+        # M5: fused decode-slot bookkeeping — one triton launch replaces the
+        # per-step host-side scatter/gather ops of the M4 torch path.
+        # SGLANG_HISPARSE_FUSED_SLOT=0 falls back to the torch path.
+        self._fused_slot = os.environ.get("SGLANG_HISPARSE_FUSED_SLOT", "1") == "1"
 
         # Benchmark stub quality: HISPARSE_BYPASS_SPREAD=1 replaces the
         # slot-0 fill of the bypass paths with a fixed pseudo-random spread
@@ -1605,7 +1611,39 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        """Allocate decode-extension slots on-demand and map out_cache_loc.
+        """Allocate decode-extension slots on-demand and map out_cache_loc."""
+        bs = req_pool_indices.shape[0]
+        if self.max_decode_len <= 0 or bs == 0:
+            return
+
+        if self._fused_slot and seq_lens_cpu.device.type == "cpu":
+            self._alloc_decode_buffer_slot_fused(
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
+            )
+        else:
+            # Fallback: env opt-out, or the *_cpu tensors unexpectedly live
+            # on device (the fused path must not pay hidden .tolist() syncs).
+            self._alloc_decode_buffer_slot_torch(
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
+            )
+
+    def _alloc_decode_buffer_slot_torch(
+        self,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        """M4 path: CPU bookkeeping + a handful of device scatter ops.
 
         All bookkeeping math (decode offsets, page-boundary detection,
         capacity alignment, scatter index construction) runs on CPU
@@ -1613,10 +1651,6 @@ class HiSparseCoordinator:
         small-op launch storm here; only the scatter writes touch the
         device (one gather of the mapped slots plus, on page-boundary
         steps, one bulk page-slot write)."""
-        bs = req_pool_indices.shape[0]
-        if self.max_decode_len <= 0 or bs == 0:
-            return
-
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         page_size = allocator.page_size
         decode_offsets = (
@@ -1679,6 +1713,70 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             out_loc
         ] = device_indices
+
+    def _alloc_decode_buffer_slot_fused(
+        self,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        """Fused path: python-side page-boundary bookkeeping (zero device
+        sync, zero tensor temporaries) plus a single triton kernel that
+        gathers the decode slot, publishes the full->hisparse mapping, and
+        writes the aligned capacity for every request in one launch."""
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        page_size = allocator.page_size
+        if page_size == 1:
+            # Non-paged configs keep the torch path.
+            self._alloc_decode_buffer_slot_torch(
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
+            )
+            return
+
+        bs = req_pool_indices.shape[0]
+        seq_list = seq_lens_cpu.tolist()
+        prefill_list = self.req_prefill_len_cpu[req_pool_indices_cpu].tolist()
+        req_ids = req_pool_indices_cpu.tolist()
+
+        rows_idx = []
+        cols_idx = []
+        for i in range(bs):
+            offset = int(seq_list[i]) - 1 - int(prefill_list[i])
+            if offset % page_size == 0:
+                base = self.padded_buffer_size + offset
+                rows_idx.extend([req_ids[i]] * page_size)
+                cols_idx.extend(range(base, base + page_size))
+
+        if rows_idx:
+            total_slots = len(rows_idx)
+            page_slots = allocator.alloc(total_slots)
+            if page_slots is None:
+                raise RuntimeError(
+                    f"HiSparse decode buffer alloc returned None (requested {total_slots})"
+                )
+            self.req_to_device_buffer[
+                torch.tensor(rows_idx, dtype=torch.int64, device=self.device),
+                torch.tensor(cols_idx, dtype=torch.int64, device=self.device),
+            ] = page_slots
+
+        hisparse_decode_slot_kernel[(bs,)](
+            seq_lens,
+            req_pool_indices,
+            out_cache_loc,
+            self.req_prefill_len,
+            self.req_to_device_buffer,
+            self.req_decode_buffer_capacity,
+            self.mem_pool_device.full_to_hisparse_device_index_mapping,
+            self.req_to_device_buffer.shape[1],
+            self.padded_buffer_size,
+            page_size,
+        )
 
     def get_front_topk_tokens(
         self,
