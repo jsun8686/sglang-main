@@ -1636,9 +1636,9 @@ class HiSparseCoordinator:
                 raise RuntimeError("HiSparse decode buffer alloc returned None")
             col_indices = (self.padded_buffer_size + decode_offsets).to(self.device)
             self.req_to_device_buffer[req_pool_indices, col_indices] = new_slots
-            self.req_decode_buffer_capacity[req_pool_indices_cpu] = (
+            self.req_decode_buffer_capacity[req_pool_indices] = (
                 decode_offsets + 1
-            )
+            ).to(self.device)
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 out_loc
             ] = new_slots.to(torch.int64)
@@ -1673,7 +1673,9 @@ class HiSparseCoordinator:
         ]
         raw_cap = decode_offsets + 1
         page_aligned_cap = (raw_cap + page_size - 1) // page_size * page_size
-        self.req_decode_buffer_capacity[req_pool_indices_cpu] = page_aligned_cap
+        self.req_decode_buffer_capacity[req_pool_indices] = (
+            page_aligned_cap.to(self.device)
+        )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             out_loc
         ] = device_indices
