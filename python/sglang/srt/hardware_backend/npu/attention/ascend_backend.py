@@ -475,6 +475,20 @@ class AscendAttnBackend(AttentionBackend):
                         forward_batch.req_pool_indices, :max_device_slots,
                     ][:, :: self.page_size] // self.page_size
                 ).to(torch.int32).contiguous()
+                # Cap the attention kernel's kv length at the device-buffer
+                # range, mirroring the graph path — the narrow block table
+                # only covers max_device_slots columns, so an uncapped full
+                # sequence length would make the kernel read uninitialized
+                # page numbers past the table end (MTE DDR out-of-range
+                # crash).  The indexer is unaffected: it reads the full
+                # length via actual_seq_lengths_kv_index.
+                seq_lens_i32 = forward_batch.seq_lens.int()
+                self.forward_metadata.actual_seq_lengths_kv = torch.minimum(
+                    seq_lens_i32,
+                    torch.full_like(
+                        seq_lens_i32, max_device_slots, dtype=torch.int32
+                    ),
+                ).to(self.device)
             else:
                 # HiSparse prefill: map logical positions to physical pages
                 physical_indices = (
