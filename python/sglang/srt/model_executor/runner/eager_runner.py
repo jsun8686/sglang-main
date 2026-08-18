@@ -229,6 +229,15 @@ class EagerRunner(BaseRunner):
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+            # load_batch rebuilds the batch via dataclasses.replace, which
+            # drops dynamically-attached attrs. Re-attach the hisparse
+            # coordinator so init_forward_metadata (kv-length cap) and
+            # forward_decode (swap-in slot translation) keep the hisparse
+            # decode path — mirrors the decode cuda graph runner's attach
+            # and the old repo's direct-batch flow.
+            coordinator = getattr(model_runner, "hisparse_coordinator", None)
+            if coordinator is not None:
+                forward_batch.hisparse_coordinator = coordinator
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
