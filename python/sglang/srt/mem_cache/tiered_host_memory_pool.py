@@ -9,9 +9,13 @@ Architecture:
 
 Data Layout:
 - Each token row stores K and V interleaved: [K(kv_lora_rank) | V(qk_rope_head_dim)].
-- host_kv_tensor shape: (num_layers, host_entries, kv_lora_rank + qk_rope_head_dim)
-- host_k_tensor = host_kv_tensor[:, :, :kv_lora_rank]  (non-contiguous view)
-- host_v_tensor = host_kv_tensor[:, :, kv_lora_rank:]  (non-contiguous view)
+- Entry-major (default): host_kv_tensor shape (num_layers, host_entries, kv+rope) is
+  reinterpreted as (host_entries, num_layers, kv+rope); all layers of one token are
+  contiguous, so an IndexShare group's rows burst in one DMA and a per-token backup
+  writes a contiguous region.
+- Layer-major (SGLANG_HISPARSE_HOST_LAYOUT=layer): legacy (num_layers, host_entries,
+  kv+rope); one contiguous region per layer.
+- host_k_tensor / host_v_tensor are non-contiguous views into the interleaved rows.
 - Interleaving allows the scatter kernel to DMA K+V in a single pipeline pass.
 """
 
@@ -57,6 +61,17 @@ class TieredHostMemoryPool:
         self.v_size = device_pool.qk_rope_head_dim * device_pool.dtype.itemsize
         self.token_stride = token_stride
         self.entry_stride = entry_stride
+
+        # Host KV layout.  "entry" (default): all layers of one token are
+        # contiguous, so an IndexShare group's K|V rows can be DMA'd from
+        # host in a single contiguous burst and a backup of one token writes
+        # a contiguous num_layers*K|V region.  "layer": legacy layout, one
+        # contiguous region per layer.  The scatter/backup kernels are told
+        # which layout is active, so this is a pure runtime switch
+        # (SGLANG_HISPARSE_HOST_LAYOUT=entry|layer).
+        self.entry_major = (
+            os.environ.get("SGLANG_HISPARSE_HOST_LAYOUT", "entry").lower() == "entry"
+        )
 
         logger.debug(
             "HiSparse: device_size %d token_stride %d entry_stride %d "
@@ -159,7 +174,11 @@ class TieredHostMemoryPool:
             self.device_pool.kv_lora_rank + self.device_pool.qk_rope_head_dim
         ) * self.device_pool.dtype.itemsize
         self._host_kv_data_ptr = self.host_dev_ptr
-        self._host_kv_layer_stride = self.host_entries * kv_row_bytes
+        if self.entry_major:
+            # All layers of one token contiguous: layer stride is one row.
+            self._host_kv_layer_stride = kv_row_bytes
+        else:
+            self._host_kv_layer_stride = self.host_entries * kv_row_bytes
 
     def get_host_kv_data_ptr(self, layer_id: int = 0) -> int:
         """Return the NPU-accessible host pointer for interleaved KV cache of ``layer_id``."""
@@ -207,14 +226,33 @@ class TieredHostMemoryPool:
 
         total_elem = num_layers * num_tokens * row_dim
         kv_buf = (ctypes.c_uint8 * (total_elem * dtype.itemsize)).from_address(self.host_ptr)
-        self.host_kv_tensor = torch.frombuffer(
-            kv_buf, dtype=dtype, count=total_elem
-        ).view(num_layers, num_tokens, row_dim)
+        if self.entry_major:
+            # Entry-major: (num_tokens, num_layers, row_dim).  All layers of
+            # one token are contiguous (group scatter burst + backup burst).
+            self.host_kv_tensor = torch.frombuffer(
+                kv_buf, dtype=dtype, count=total_elem
+            ).view(num_tokens, num_layers, row_dim)
+        else:
+            self.host_kv_tensor = torch.frombuffer(
+                kv_buf, dtype=dtype, count=total_elem
+            ).view(num_layers, num_tokens, row_dim)
         # Non-contiguous views into the interleaved layout; PyTorch tensor
         # operations (copy_, index_copy_, advanced indexing) handle the
         # strides transparently.
         self.host_k_tensor = self.host_kv_tensor[:, :, :kv_lora_rank]
         self.host_v_tensor = self.host_kv_tensor[:, :, kv_lora_rank:]
+
+    def _layer_k_view(self, layer_id: int) -> torch.Tensor:
+        """Per-layer (num_tokens, kv_lora_rank) view, layout-agnostic."""
+        if self.entry_major:
+            return self.host_k_tensor[:, layer_id]
+        return self.host_k_tensor[layer_id]
+
+    def _layer_v_view(self, layer_id: int) -> torch.Tensor:
+        """Per-layer (num_tokens, qk_rope_head_dim) view, layout-agnostic."""
+        if self.entry_major:
+            return self.host_v_tensor[:, layer_id]
+        return self.host_v_tensor[layer_id]
 
     def get_token_stride_size(self) -> int:
         kv_cache_dim = self.override_kv_cache_dim or (
@@ -360,20 +398,27 @@ class TieredHostMemoryPool:
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
     ):
+        if self.entry_major and str(device_pool.device).startswith("npu"):
+            self._backup_to_host_kernel(device_pool, host_indices, device_indices)
+            return
+
         num_tokens = host_indices.numel()
         batch_size = self.block_size
+        host_indices_cpu = (
+            host_indices.cpu() if host_indices.device.type == "npu" else host_indices
+        )
 
         for layer_id in range(device_pool.layer_num):
             kv_lora_rank = device_pool.kv_lora_rank
             qk_rope_head_dim = device_pool.qk_rope_head_dim
 
+            host_k_layer = self._layer_k_view(layer_id)
+            host_v_layer = self._layer_v_view(layer_id)
+
             for start in range(0, num_tokens, batch_size):
                 end = min(start + batch_size, num_tokens)
-                host_batch = host_indices[start:end]
+                host_batch = host_indices_cpu[start:end]
                 device_batch = device_indices[start:end]
-
-                host_start = int(host_batch[0].item())
-                host_end = int(host_batch[-1].item()) + 1
 
                 device_k = (
                     device_pool.k_buffer[layer_id]
@@ -386,10 +431,36 @@ class TieredHostMemoryPool:
                     .contiguous()
                 )
 
-                host_k_block = self.host_k_tensor[layer_id][host_start:host_end]
-                host_v_block = self.host_v_tensor[layer_id][host_start:host_end]
-                host_k_block.copy_(device_k)
-                host_v_block.copy_(device_v)
+                host_k_layer.index_copy_(0, host_batch, device_k.cpu())
+                host_v_layer.index_copy_(0, host_batch, device_v.cpu())
+
+    def _backup_to_host_kernel(
+        self,
+        device_pool,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ):
+        """Direct-DMA backup: per (token, layer) one device K+V read pair and
+        one contiguous host write.  Entry-major makes each token's host
+        destination a contiguous num_layers * [K|V] region."""
+        from sglang.srt.hardware_backend.npu.op_impl import hisparse as hisparse_lru
+
+        device = device_pool.device
+        host_idx = host_indices.to(device=device, dtype=torch.int64)
+        dev_idx = device_indices.to(device=device, dtype=torch.int64)
+
+        hisparse_lru.backup_to_host_npu(
+            device_k_buffer=device_pool.k_buffer,
+            device_v_buffer=device_pool.v_buffer,
+            host_kv_cache_ptr=self.host_dev_ptr,
+            host_indices=host_idx,
+            device_indices=dev_idx,
+            host_entries=self.host_entries,
+            host_num_layers=self.num_layers,
+            k_row_bytes=self.k_size,
+            v_row_bytes=self.v_size,
+            num_tokens=host_idx.numel(),
+        )
 
     def backup_from_device_all_layer_split(
             self,
@@ -404,10 +475,10 @@ class TieredHostMemoryPool:
             device_k = device_pool.k_buffer[layer_id].view(-1, kv_lora_rank)[device_indices]
             device_v = device_pool.v_buffer[layer_id].view(-1, qk_rope_head_dim)[device_indices]
 
-            self.host_k_tensor[layer_id].index_copy_(
+            self._layer_k_view(layer_id).index_copy_(
                 0, host_indices, device_k.cpu()
             )
-            self.host_v_tensor[layer_id].index_copy_(
+            self._layer_v_view(layer_id).index_copy_(
                 0, host_indices, device_v.cpu()
             )
 
@@ -420,8 +491,8 @@ class TieredHostMemoryPool:
         kv_lora_rank = self.device_pool.kv_lora_rank
         qk_rope_head_dim = self.device_pool.qk_rope_head_dim
 
-        host_k_block = self.host_k_tensor[layer_id][host_indices]
-        host_v_block = self.host_v_tensor[layer_id][host_indices]
+        host_k_block = self._layer_k_view(layer_id)[host_indices]
+        host_v_block = self._layer_v_view(layer_id)[host_indices]
 
         device_k_block = host_k_block.to("npu")
         device_v_block = host_v_block.to("npu")
@@ -443,7 +514,11 @@ class TieredHostMemoryPool:
         host_indices_list = host_indices.tolist()
         # In the interleaved layout each token's K+V row is contiguous, so we
         # can copy the full row in a single memmove via host_kv_tensor.
-        host_kv = self.host_kv_tensor[layer_id][host_indices_list]
+        # (Entry-major: dim0 is the token, so the per-layer row view is [:, layer].)
+        if self.entry_major:
+            host_kv = self.host_kv_tensor[:, layer_id][host_indices_list]
+        else:
+            host_kv = self.host_kv_tensor[layer_id][host_indices_list]
         for i in range(host_indices.numel()):
             ctypes.memmove(out_ptr + i * row_size, int(host_kv[i].data_ptr()), row_size)
 

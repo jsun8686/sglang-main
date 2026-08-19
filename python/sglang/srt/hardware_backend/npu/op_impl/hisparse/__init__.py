@@ -266,6 +266,8 @@ def scatter_from_host_npu(
     padded_buffer_size: int,
     max_num_reqs: int,
     top_k: int,
+    host_entry_major: bool = False,
+    host_num_layers: int = 1,
     block_dim: int = 0,
 ) -> None:
     """
@@ -274,10 +276,12 @@ def scatter_from_host_npu(
     ``host_kv_cache_ptr`` is the raw base pointer of the interleaved pinned host
     cache (e.g. ``TieredHostMemoryPool.get_host_kv_data_ptr(0)``) where each
     token row is laid out as ``[K_data | V_data]`` contiguously; the kernel
-    applies the per-layer offset itself. ``max_context_len`` is the row stride
-    of ``req_to_host_pool`` and ``device_buffer_row_stride`` the row stride of
-    ``req_to_device_buffer``. The kernel reads directly from host memory using
-    these addresses.
+    applies the per-layer offset itself.  ``host_entry_major`` selects the
+    host layout: True — all layers of one entry are contiguous (layer stride
+    = one row); False — legacy layout, one contiguous region per layer.
+    ``max_context_len`` is the row stride of ``req_to_host_pool`` and
+    ``device_buffer_row_stride`` the row stride of ``req_to_device_buffer``.
+    The kernel reads directly from host memory using these addresses.
     """
     if k_row_bytes <= 0 or v_row_bytes <= 0:
         raise ValueError("scatter_from_host_npu: k_row_bytes and v_row_bytes must be > 0")
@@ -285,6 +289,8 @@ def scatter_from_host_npu(
         raise ValueError(
             "scatter_from_host_npu: k_row_bytes and v_row_bytes must be multiples of 32 bytes"
         )
+    if host_num_layers <= 0:
+        raise ValueError("scatter_from_host_npu: host_num_layers must be > 0")
     _require_kernel()
     _hisparse_lru.scatter_from_host(
         host_kv_cache_ptr,
@@ -305,6 +311,156 @@ def scatter_from_host_npu(
         padded_buffer_size,
         max_num_reqs,
         top_k,
+        bool(host_entry_major),
+        host_num_layers,
+        _resolve_block_dim(block_dim),
+    )
+
+
+def scatter_from_host_group_npu(
+    host_kv_cache_ptr: int,
+    topk_indices: torch.Tensor,
+    top_k_device_slots: torch.Tensor,
+    is_miss: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_host_pool: torch.Tensor,
+    req_to_device_buffer: torch.Tensor,
+    device_k_buffer: torch.Tensor,
+    device_v_buffer: torch.Tensor,
+    anchor_layer_id: int,
+    group_size: int,
+    host_entries: int,
+    k_row_bytes: int,
+    v_row_bytes: int,
+    max_context_len: int,
+    device_buffer_row_stride: int,
+    padded_buffer_size: int,
+    max_num_reqs: int,
+    top_k: int,
+    host_entry_major: bool = False,
+    host_num_layers: int = 1,
+    block_dim: int = 0,
+) -> None:
+    """
+    Group scatter for IndexShare models: scatter missing KV rows into the
+    anchor layer's device buffer AND its trailing shared-index (skip) layers'
+    buffers in one launch.
+
+    ``device_k_buffer`` / ``device_v_buffer`` must be the FULL layer-stacked
+    pools (shape ``[layer_num, ...]``); the kernel derives each group layer's
+    base from ``anchor_layer_id + g``.  ``group_size = 1 + number of skip
+    layers`` covered by this anchor.  Skip layers then reuse the anchor's
+    ``top_k_device_slots`` directly without launching their own kernels.
+
+    With ``host_entry_major=True`` the whole group's K|V rows are fetched
+    from host in a single contiguous burst (all layers of one host entry are
+    adjacent); otherwise one DMA per (miss, layer).
+    """
+    if k_row_bytes <= 0 or v_row_bytes <= 0:
+        raise ValueError(
+            "scatter_from_host_group_npu: k_row_bytes and v_row_bytes must be > 0"
+        )
+    if k_row_bytes % 32 != 0 or v_row_bytes % 32 != 0:
+        raise ValueError(
+            "scatter_from_host_group_npu: k_row_bytes and v_row_bytes must be "
+            "multiples of 32 bytes"
+        )
+    if host_num_layers <= 0:
+        raise ValueError("scatter_from_host_group_npu: host_num_layers must be > 0")
+    if device_k_buffer.dim() < 2 or device_k_buffer.size(0) != device_v_buffer.size(0):
+        raise ValueError(
+            "scatter_from_host_group_npu: device buffers must be the full "
+            "layer-stacked pools with matching layer counts"
+        )
+    layer_num = device_k_buffer.size(0)
+    if not (0 <= anchor_layer_id < layer_num):
+        raise ValueError("scatter_from_host_group_npu: anchor_layer_id out of range")
+    if not (1 <= group_size <= layer_num - anchor_layer_id):
+        raise ValueError("scatter_from_host_group_npu: group exceeds the layer range")
+    if host_entry_major and host_num_layers != layer_num:
+        raise ValueError(
+            "scatter_from_host_group_npu: entry-major host pool layer count mismatch"
+        )
+    _require_kernel()
+    _hisparse_lru.scatter_from_host_group(
+        host_kv_cache_ptr,
+        topk_indices,
+        top_k_device_slots,
+        is_miss,
+        req_pool_indices,
+        req_to_host_pool,
+        req_to_device_buffer,
+        device_k_buffer,
+        device_v_buffer,
+        anchor_layer_id,
+        group_size,
+        host_entries,
+        k_row_bytes,
+        v_row_bytes,
+        max_context_len,
+        device_buffer_row_stride,
+        padded_buffer_size,
+        max_num_reqs,
+        top_k,
+        bool(host_entry_major),
+        host_num_layers,
+        _resolve_block_dim(block_dim),
+    )
+
+
+def backup_to_host_npu(
+    device_k_buffer: torch.Tensor,
+    device_v_buffer: torch.Tensor,
+    host_kv_cache_ptr: int,
+    host_indices: torch.Tensor,
+    device_indices: torch.Tensor,
+    host_entries: int,
+    host_num_layers: int,
+    k_row_bytes: int,
+    v_row_bytes: int,
+    num_tokens: int,
+    block_dim: int = 0,
+) -> None:
+    """
+    Backup full-layer KV rows from the device pool to the entry-major pinned
+    host pool via direct DMA.
+
+    ``device_k_buffer`` / ``device_v_buffer`` are the FULL layer-stacked
+    pools; per (token, layer) the kernel reads the device K row and V row and
+    writes the interleaved [K|V] row into the host entry region — a
+    contiguous ``num_layers * kv_row_bytes`` destination per token.
+    ``host_indices`` / ``device_indices`` must be int64 device tensors of
+    length ``num_tokens``.
+    """
+    if num_tokens <= 0:
+        raise ValueError("backup_to_host_npu: num_tokens must be > 0")
+    if k_row_bytes <= 0 or v_row_bytes <= 0:
+        raise ValueError("backup_to_host_npu: k_row_bytes and v_row_bytes must be > 0")
+    if k_row_bytes % 32 != 0 or v_row_bytes % 32 != 0:
+        raise ValueError(
+            "backup_to_host_npu: k_row_bytes and v_row_bytes must be multiples of 32 bytes"
+        )
+    if host_indices.dtype != torch.int64 or device_indices.dtype != torch.int64:
+        raise ValueError("backup_to_host_npu: index tensors must be int64")
+    if host_indices.numel() != num_tokens or device_indices.numel() != num_tokens:
+        raise ValueError("backup_to_host_npu: index lengths must equal num_tokens")
+    layer_num = device_k_buffer.size(0)
+    if layer_num != device_v_buffer.size(0):
+        raise ValueError("backup_to_host_npu: device buffer layer counts differ")
+    if host_num_layers != layer_num:
+        raise ValueError("backup_to_host_npu: host pool layer count mismatch")
+    _require_kernel()
+    _hisparse_lru.backup_to_host(
+        device_k_buffer,
+        device_v_buffer,
+        host_kv_cache_ptr,
+        host_indices,
+        device_indices,
+        host_entries,
+        host_num_layers,
+        k_row_bytes,
+        v_row_bytes,
+        num_tokens,
         _resolve_block_dim(block_dim),
     )
 
@@ -314,4 +470,6 @@ __all__ = [
     "sieve_update_npu",
     "sieve_ht_init_npu",
     "scatter_from_host_npu",
+    "scatter_from_host_group_npu",
+    "backup_to_host_npu",
 ]

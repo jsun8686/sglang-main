@@ -8,6 +8,8 @@
 #include "aclrtlaunch_hisparse_sieve_update.h"
 #include "aclrtlaunch_hisparse_sieve_ht_init.h"
 #include "aclrtlaunch_hisparse_scatter_from_host.h"
+#include "aclrtlaunch_hisparse_scatter_from_host_group.h"
+#include "aclrtlaunch_hisparse_backup_to_host.h"
 
 extern "C" void launch_hisparse_lru_update(
     uint32_t blockDim,
@@ -155,7 +157,9 @@ extern "C" void launch_hisparse_scatter_from_host(
     int32_t top_k,
     int32_t positions_per_core,
     int32_t host_pool_rows,
-    int32_t device_pool_rows)
+    int32_t device_pool_rows,
+    int32_t host_entry_major,
+    int32_t host_num_layers)
 {
     ACLRT_LAUNCH_KERNEL(hisparse_scatter_from_host)(
         blockDim,
@@ -180,5 +184,101 @@ extern "C" void launch_hisparse_scatter_from_host(
         top_k,
         positions_per_core,
         host_pool_rows,
-        device_pool_rows);
+        device_pool_rows,
+        host_entry_major,
+        host_num_layers);
+}
+
+extern "C" void launch_hisparse_backup_to_host(
+    uint32_t blockDim,
+    void* stream,
+    void* device_k_buffer,
+    void* device_v_buffer,
+    void* host_kv_cache,
+    void* host_indices,
+    void* device_indices,
+    int32_t num_tokens,
+    int32_t host_entries,
+    int32_t host_num_layers,
+    int32_t device_layer_row_count,
+    int32_t device_layer_num,
+    int32_t k_row_bytes,
+    int32_t v_row_bytes,
+    int32_t tokens_per_core)
+{
+    ACLRT_LAUNCH_KERNEL(hisparse_backup_to_host)(
+        blockDim,
+        (aclrtStream)stream,
+        (uint8_t*)device_k_buffer,
+        (uint8_t*)device_v_buffer,
+        (uint8_t*)host_kv_cache,
+        (uint8_t*)host_indices,
+        (uint8_t*)device_indices,
+        num_tokens,
+        host_entries,
+        host_num_layers,
+        device_layer_row_count,
+        device_layer_num,
+        k_row_bytes,
+        v_row_bytes,
+        tokens_per_core);
+}
+
+extern "C" void launch_hisparse_scatter_from_host_group(
+    uint32_t blockDim,
+    void* stream,
+    void* host_kv_cache,
+    void* topk_indices,
+    void* top_k_device_slots,
+    void* is_miss,
+    void* req_pool_indices,
+    void* req_to_host_pool,
+    void* req_to_device_buffer,
+    void* device_k_buffer,
+    void* device_v_buffer,
+    int32_t anchor_layer_id,
+    int32_t group_size,
+    int32_t host_entries,
+    int32_t k_row_bytes,
+    int32_t v_row_bytes,
+    int32_t max_context_len,
+    int32_t device_buffer_row_stride,
+    int32_t padded_buffer_size,
+    int32_t max_num_reqs,
+    int32_t top_k,
+    int32_t positions_per_core,
+    int32_t host_pool_rows,
+    int32_t device_layer_row_count,
+    int32_t device_layer_num,
+    int32_t host_entry_major,
+    int32_t host_num_layers)
+{
+    ACLRT_LAUNCH_KERNEL(hisparse_scatter_from_host_group)(
+        blockDim,
+        (aclrtStream)stream,
+        (uint8_t*)host_kv_cache,
+        (uint8_t*)topk_indices,
+        (uint8_t*)top_k_device_slots,
+        (uint8_t*)is_miss,
+        (uint8_t*)req_pool_indices,
+        (uint8_t*)req_to_host_pool,
+        (uint8_t*)req_to_device_buffer,
+        (uint8_t*)device_k_buffer,
+        (uint8_t*)device_v_buffer,
+        anchor_layer_id,
+        group_size,
+        host_entries,
+        k_row_bytes,
+        v_row_bytes,
+        max_context_len,
+        device_buffer_row_stride,
+        padded_buffer_size,
+        max_num_reqs,
+        top_k,
+        positions_per_core,
+        host_pool_rows,
+        device_layer_row_count,
+        device_layer_num,
+        host_entry_major,
+        host_num_layers);
 }

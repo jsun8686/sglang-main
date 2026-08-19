@@ -11,6 +11,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
+from sglang.kernels.ops.memory.allocator import hisparse_decode_slot_kernel
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
@@ -156,7 +157,9 @@ class HiSparseCoordinator:
             )
 
         # NPU uses a different swap-in path; the CUDA plan-then-IO prefetch
-        # is not applicable (IndexShare scatter will be handled separately).
+        # stream machinery is not applicable.  NPU instead groups the
+        # shared-index layers under their anchor: the anchor's scatter fills
+        # the whole group's device buffers and skip layers become no-ops.
         if not self.is_npu:
             self._init_shared_index_prefetch(
                 shared_index_layers=shared_index_layers,
@@ -164,10 +167,10 @@ class HiSparseCoordinator:
                 max_num_req_slots=req_to_token_pool.req_to_token.shape[0],
             )
         else:
-            self.enable_prefetch = False
-            self._is_shared_index_layer = None
-            self._prefetch_groups = {}
-            self._prefetch_slot = []
+            self._init_shared_index_npu(
+                shared_index_layers=shared_index_layers,
+                layer_num=self.mem_pool_device.layer_num,
+            )
 
     def _init_cuda(
         self,
@@ -348,6 +351,16 @@ class HiSparseCoordinator:
         self.req_prefill_len = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+        # CPU mirror of req_prefill_len: the scheduler-side decode
+        # bookkeeping (alloc_decode_buffer_slot) reads prefill lengths from
+        # CPU to avoid per-step device gathers and .item() syncs.  All
+        # writes go through _set_req_prefill_len to keep the two in sync.
+        self.req_prefill_len_cpu = torch.zeros(
+            max_num_reqs, dtype=torch.int64, device="cpu"
+        )
+        # Cached CPU arange for decode page-slot column construction; sized
+        # to the hisparse allocator page size on first use.
+        self._page_arange_cpu = None
         self.req_decode_buffer_capacity = torch.zeros(
             max_num_reqs, dtype=torch.int64, device=device
         )
@@ -440,12 +453,47 @@ class HiSparseCoordinator:
         self._bypass_swap_1 = os.environ.get("HISPARSE_BYPASS_SWAP_1", "0") == "1"
         self._bypass_swap_2 = os.environ.get("HISPARSE_BYPASS_SWAP_2", "0") == "1"
 
+        # M5: fused decode-slot bookkeeping — one triton launch replaces the
+        # per-step host-side scatter/gather ops of the M4 torch path.
+        # SGLANG_HISPARSE_FUSED_SLOT=0 falls back to the torch path.
+        self._fused_slot = os.environ.get("SGLANG_HISPARSE_FUSED_SLOT", "1") == "1"
+
+        # Benchmark stub quality: HISPARSE_BYPASS_SPREAD=1 replaces the
+        # slot-0 fill of the bypass paths with a fixed pseudo-random spread
+        # over [0, device_buffer_size) so the attention gather reads a
+        # realistic row distribution (throughput ceiling measurement).
+        # HISPARSE_BYPASS_SPREAD_VARY=1 rotates the pattern by one slot per
+        # call via a device counter (also advances under NPU graph replay).
+        # Built eagerly here: a lazy H2D build inside the first decode
+        # forward would be captured by the NPU graph.
+        self._bypass_spread = os.environ.get("HISPARSE_BYPASS_SPREAD", "0") == "1"
+        self._bypass_spread_vary = (
+            os.environ.get("HISPARSE_BYPASS_SPREAD_VARY", "0") == "1"
+        )
+        self._bypass_spread_slots = None
+        self._bypass_spread_off = None
+        if self._bypass_spread:
+            self._init_bypass_spread_slots()
+            self._bypass_spread_off = torch.zeros(1, dtype=torch.int32, device=device)
+            logger.info(
+                "HiSparse NPU: bypass spread stub enabled (vary=%s), slots "
+                "spread over [0, %d)",
+                self._bypass_spread_vary,
+                self.device_buffer_size,
+            )
+
         # Lightweight miss-rate statistics
         self._miss_stats_on = os.environ.get("HISPARSE_MISS_STATS", "0") == "1"
         self._miss_stats_interval = int(
             os.environ.get("HISPARSE_MISS_STATS_INTERVAL", "20")
         )
         self._layer_num = layer_num
+        # Layers that actually run LRU/SIEVE + scatter at decode.  Defaults
+        # cover the non-shared path (every layer); _init_shared_index_npu
+        # overrides these when IndexShare grouping is active.
+        self._swap_layers = list(range(layer_num))
+        self._last_swap_layer = layer_num - 1
+        self._swap_layer_count = layer_num
         self._stats_rank0 = torch.distributed.get_rank(self.tp_group) == 0
         if self._miss_stats_on:
             self._miss_rows_accum = torch.zeros(1, dtype=torch.int64, device=device)
@@ -562,6 +610,49 @@ class HiSparseCoordinator:
             sum(self._is_shared_index_layer),
             layer_num,
         )
+
+    def _init_shared_index_npu(
+        self,
+        shared_index_layers: Optional[List[bool]],
+        layer_num: int,
+    ) -> None:
+        """Set up IndexShare group tracking for the NPU swap-in path.
+
+        Anchors run LRU/SIEVE once and a single group-scatter kernel fills
+        their trailing shared-index (skip) layers' device buffers; skip
+        layers return the anchor's slot table directly (zero kernel work).
+        Correctness rests on the lockstep invariant: admission initializes
+        and finish/abort clears every layer's buffer state identically, and
+        only anchors ever mutate the shared slot table, so a group's layers
+        always agree on slot contents.
+        """
+        if shared_index_layers is not None and len(shared_index_layers) != layer_num:
+            logger.warning(
+                "HiSparse NPU shared-index grouping disabled: pattern length "
+                "%d != KV pool layer_num %d; using per-layer swap-in.",
+                len(shared_index_layers),
+                layer_num,
+            )
+            shared_index_layers = None
+        self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
+        self.enable_prefetch = any(self._is_shared_index_layer)
+        self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
+            self._is_shared_index_layer
+        )
+        if self.enable_prefetch:
+            self._swap_layers = [
+                i for i, shared in enumerate(self._is_shared_index_layer) if not shared
+            ]
+            self._last_swap_layer = max(self._swap_layers)
+            self._swap_layer_count = len(self._swap_layers)
+            logger.info(
+                "HiSparse NPU: shared-index group swap-in enabled; %d anchor "
+                "group(s), %d skip layer(s) of %d total (%d swap-in layers).",
+                len(self._prefetch_groups),
+                sum(self._is_shared_index_layer),
+                layer_num,
+                self._swap_layer_count,
+            )
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -846,6 +937,14 @@ class HiSparseCoordinator:
             ready_reqs.append(req)
         return ready_reqs
 
+    def _set_req_prefill_len(self, req_pool_idx: int, value: int) -> None:
+        """Write the per-request prefill length to the device copy (consumed
+        by the LRU/SIEVE kernels) and the CPU mirror (consumed by the
+        scheduler-side decode bookkeeping) atomically from the caller's
+        perspective."""
+        self.req_prefill_len[req_pool_idx] = value
+        self.req_prefill_len_cpu[req_pool_idx] = value
+
     def map_last_loc_to_buffer(
         self,
         seq_lens: torch.Tensor,
@@ -856,7 +955,11 @@ class HiSparseCoordinator:
     ) -> None:
         if self.is_npu:
             self.alloc_decode_buffer_slot(
-                seq_lens, out_cache_loc, req_pool_indices
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
             )
             return
         self._eager_backup_previous_token(
@@ -1335,7 +1438,7 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        self.req_prefill_len[req.req_pool_idx] = prefill_len
+        self._set_req_prefill_len(req.req_pool_idx, prefill_len)
         aligned_prefill_len = self._aligned_size(prefill_len)
         host_indices = self.mem_pool_host.alloc(aligned_prefill_len)
         if host_indices is None:
@@ -1467,7 +1570,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_prefill_len[req.req_pool_idx] = 0
+        self._set_req_prefill_len(req.req_pool_idx, 0)
         self.req_decode_buffer_capacity[req.req_pool_idx] = 0
         self.device_buffer_tokens[:, req.req_pool_idx, :] = -1
         if self._eviction_algo == "lru":
@@ -1492,7 +1595,7 @@ class HiSparseCoordinator:
         self.req_host_allocated_len[req.req_pool_idx] = 0
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_prefill_len[req.req_pool_idx] = 0
+        self._set_req_prefill_len(req.req_pool_idx, 0)
         self.req_decode_buffer_capacity[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.device_buffer_tokens[:, req.req_pool_idx, :] = -1
@@ -1505,31 +1608,78 @@ class HiSparseCoordinator:
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
     ) -> None:
         """Allocate decode-extension slots on-demand and map out_cache_loc."""
         bs = req_pool_indices.shape[0]
         if self.max_decode_len <= 0 or bs == 0:
             return
 
+        if self._fused_slot and seq_lens_cpu.device.type == "cpu":
+            self._alloc_decode_buffer_slot_fused(
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
+            )
+        else:
+            # Fallback: env opt-out, or the *_cpu tensors unexpectedly live
+            # on device (the fused path must not pay hidden .tolist() syncs).
+            self._alloc_decode_buffer_slot_torch(
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
+            )
+
+    def _alloc_decode_buffer_slot_torch(
+        self,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        """M4 path: CPU bookkeeping + a handful of device scatter ops.
+
+        All bookkeeping math (decode offsets, page-boundary detection,
+        capacity alignment, scatter index construction) runs on CPU
+        mirrors, so a decode step pays no device synchronization and no
+        small-op launch storm here; only the scatter writes touch the
+        device (one gather of the mapped slots plus, on page-boundary
+        steps, one bulk page-slot write)."""
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         page_size = allocator.page_size
-        prefill_len = self.req_prefill_len[req_pool_indices]
-        decode_offsets = seq_lens.to(torch.int64) - 1 - prefill_len.to(torch.int64)
+        decode_offsets = (
+            seq_lens_cpu.to(torch.int64)
+            - 1
+            - self.req_prefill_len_cpu[req_pool_indices_cpu]
+        )
+        out_loc = (
+            out_cache_loc
+            if out_cache_loc.dtype == torch.int64
+            else out_cache_loc.to(torch.int64)
+        )
 
         if page_size == 1:
             new_slots = allocator.alloc(bs)
             if new_slots is None:
                 raise RuntimeError("HiSparse decode buffer alloc returned None")
-            col_indices = self.padded_buffer_size + decode_offsets
+            col_indices = (self.padded_buffer_size + decode_offsets).to(self.device)
             self.req_to_device_buffer[req_pool_indices, col_indices] = new_slots
-            self.req_decode_buffer_capacity[req_pool_indices] = decode_offsets + 1
+            self.req_decode_buffer_capacity[req_pool_indices] = (
+                decode_offsets + 1
+            ).to(self.device)
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                out_cache_loc.to(torch.int64)
+                out_loc
             ] = new_slots.to(torch.int64)
             return
 
         needs_alloc = decode_offsets % page_size == 0
-        num_new = int(needs_alloc.sum().item())
+        num_new = int(needs_alloc.sum())
         if num_new > 0:
             total_slots = num_new * page_size
             page_slots = allocator.alloc(total_slots)
@@ -1538,27 +1688,95 @@ class HiSparseCoordinator:
                     f"HiSparse decode buffer alloc returned None (requested {total_slots})"
                 )
             page_slots = page_slots.view(num_new, page_size)
-            boundary_reqs = req_pool_indices[needs_alloc]
-            boundary_offsets = decode_offsets[needs_alloc]
-            col_base = self.padded_buffer_size + boundary_offsets
-            cols = (
-                col_base.unsqueeze(1)
-                + torch.arange(page_size, device=self.device).unsqueeze(0)
+            col_base = self.padded_buffer_size + decode_offsets[needs_alloc]
+            page_arange = self._page_arange_cpu
+            if page_arange is None or page_arange.numel() != page_size:
+                page_arange = torch.arange(page_size, dtype=torch.int64)
+                self._page_arange_cpu = page_arange
+            cols_cpu = col_base.unsqueeze(1) + page_arange.unsqueeze(0)
+            rows_cpu = req_pool_indices_cpu[needs_alloc].unsqueeze(1).expand(
+                -1, page_size
             )
             self.req_to_device_buffer[
-                boundary_reqs.unsqueeze(1).expand(-1, page_size), cols
+                rows_cpu.to(self.device), cols_cpu.to(self.device)
             ] = page_slots
 
         device_indices = self.req_to_device_buffer[
             req_pool_indices,
-            self.padded_buffer_size + decode_offsets,
+            (self.padded_buffer_size + decode_offsets).to(self.device),
         ]
         raw_cap = decode_offsets + 1
         page_aligned_cap = (raw_cap + page_size - 1) // page_size * page_size
-        self.req_decode_buffer_capacity[req_pool_indices] = page_aligned_cap
+        self.req_decode_buffer_capacity[req_pool_indices] = (
+            page_aligned_cap.to(self.device)
+        )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
-            out_cache_loc.to(torch.int64)
-        ] = device_indices.to(torch.int64)
+            out_loc
+        ] = device_indices
+
+    def _alloc_decode_buffer_slot_fused(
+        self,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        """Fused path: python-side page-boundary bookkeeping (zero device
+        sync, zero tensor temporaries) plus a single triton kernel that
+        gathers the decode slot, publishes the full->hisparse mapping, and
+        writes the aligned capacity for every request in one launch."""
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        page_size = allocator.page_size
+        if page_size == 1:
+            # Non-paged configs keep the torch path.
+            self._alloc_decode_buffer_slot_torch(
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
+            )
+            return
+
+        bs = req_pool_indices.shape[0]
+        seq_list = seq_lens_cpu.tolist()
+        prefill_list = self.req_prefill_len_cpu[req_pool_indices_cpu].tolist()
+        req_ids = req_pool_indices_cpu.tolist()
+
+        rows_idx = []
+        cols_idx = []
+        for i in range(bs):
+            offset = int(seq_list[i]) - 1 - int(prefill_list[i])
+            if offset % page_size == 0:
+                base = self.padded_buffer_size + offset
+                rows_idx.extend([req_ids[i]] * page_size)
+                cols_idx.extend(range(base, base + page_size))
+
+        if rows_idx:
+            total_slots = len(rows_idx)
+            page_slots = allocator.alloc(total_slots)
+            if page_slots is None:
+                raise RuntimeError(
+                    f"HiSparse decode buffer alloc returned None (requested {total_slots})"
+                )
+            self.req_to_device_buffer[
+                torch.tensor(rows_idx, dtype=torch.int64, device=self.device),
+                torch.tensor(cols_idx, dtype=torch.int64, device=self.device),
+            ] = page_slots
+
+        hisparse_decode_slot_kernel[(bs,)](
+            seq_lens,
+            req_pool_indices,
+            out_cache_loc,
+            self.req_prefill_len,
+            self.req_to_device_buffer,
+            self.req_decode_buffer_capacity,
+            self.mem_pool_device.full_to_hisparse_device_index_mapping,
+            self.req_to_device_buffer.shape[1],
+            self.padded_buffer_size,
+            page_size,
+        )
 
     def get_front_topk_tokens(
         self,
@@ -1572,6 +1790,51 @@ class HiSparseCoordinator:
         mask = topk_col_indices >= seq_lens.unsqueeze(1)
         top_k_indices[mask] = -1
         return top_k_indices
+
+    def _init_bypass_spread_slots(self) -> None:
+        """Benchmark-only: build the fixed pseudo-random slot table used by
+        the bypass spread stub.  Each request row gets its own distinct slot
+        permutation (fixed CPU seed, reproducible); values stay within
+        [0, device_buffer_size) so every downstream translation path is
+        in-bounds."""
+        dbs = self.device_buffer_size
+        num_rows = self.req_to_device_buffer.shape[0]
+        gen = torch.Generator(device="cpu").manual_seed(20260817)
+        rows = []
+        for _ in range(num_rows):
+            if self.top_k <= dbs:
+                rows.append(
+                    torch.randperm(dbs, generator=gen, dtype=torch.int32)[
+                        : self.top_k
+                    ]
+                )
+            else:
+                rows.append(
+                    torch.randint(
+                        0, dbs, (self.top_k,), generator=gen, dtype=torch.int32
+                    )
+                )
+        self._bypass_spread_slots = torch.stack(rows).contiguous().to(self.device)
+
+    def _fill_bypass_slots(
+        self,
+        slots: torch.Tensor,
+        top_k_tokens: torch.Tensor,
+        num_real: int,
+    ) -> None:
+        """Overwrite the live ``top_k_device_slots`` rows with the spread
+        stub, preserving the -1 padding semantics for invalid tokens.  With
+        VARY enabled the pattern rotates by one slot per call (int32 device
+        counter, so the rotation also advances under NPU graph replay)."""
+        if self._bypass_spread_vary:
+            self._bypass_spread_off.add_(1)
+            slots.copy_(
+                (self._bypass_spread_slots[:num_real] + self._bypass_spread_off)
+                % self.device_buffer_size
+            )
+        else:
+            slots.copy_(self._bypass_spread_slots[:num_real])
+        slots.masked_fill_(top_k_tokens == -1, -1)
 
     def _swap_in_selected_pages_npu(
         self,
@@ -1595,9 +1858,19 @@ class HiSparseCoordinator:
 
         if self._bypass_swap:
             slots = self.top_k_device_slots[:num_real]
-            slots.fill_(0)
-            slots.masked_fill_(top_k_result == -1, -1)
+            if self._bypass_spread:
+                self._fill_bypass_slots(slots, top_k_result, num_real)
+            else:
+                slots.fill_(0)
+                slots.masked_fill_(top_k_result == -1, -1)
             return slots.view(num_real, 1, -1)
+
+        # IndexShare skip layer: reuse the anchor's swap-in results.  Same
+        # top-k indices -> same LRU/SIEVE decisions -> same slot table, and
+        # the anchor's group scatter already filled this layer's device
+        # buffer (lockstep layout), so there is nothing left to do.
+        if self.enable_prefetch and self._is_shared_index_layer[layer_id]:
+            return self.top_k_device_slots[:num_real].view(num_real, 1, -1)
 
         self._load_cache_to_device_buffer_npu(
             top_k_tokens=top_k_result,
@@ -1622,7 +1895,9 @@ class HiSparseCoordinator:
             self.top_k_device_slots.fill_(-1)
 
         timed_layer = (
-            self._miss_stats_on and layer_id == self._stats_steps % self._layer_num
+            self._miss_stats_on
+            and layer_id
+            == self._swap_layers[self._stats_steps % self._swap_layer_count]
         )
         if timed_layer:
             ev_lru_start, ev_lru_end, ev_scatter_end = self._timing_events[
@@ -1673,30 +1948,64 @@ class HiSparseCoordinator:
         if self._bypass_swap_1:
             num_real = req_pool_indices.shape[0]
             slots = self.top_k_device_slots[:num_real]
-            slots.fill_(0)
-            slots.masked_fill_(top_k_tokens == -1, -1)
+            if self._bypass_spread:
+                self._fill_bypass_slots(slots, top_k_tokens, num_real)
+            else:
+                slots.fill_(0)
+                slots.masked_fill_(top_k_tokens == -1, -1)
             return
 
-        self._lru_npu.scatter_from_host_npu(
-            host_kv_cache_ptr=self.host_kv_cache_base_ptr,
-            topk_indices=top_k_tokens,
-            top_k_device_slots=self.top_k_device_slots,
-            is_miss=self.is_miss,
-            req_pool_indices=req_pool_indices,
-            req_to_host_pool=self.req_to_host_pool,
-            req_to_device_buffer=self.req_to_device_buffer,
-            device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
-            device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
-            layer_id=layer_id,
-            host_entries=self.mem_pool_host.host_entries,
-            k_row_bytes=self.mem_pool_device.kv_lora_rank * self.mem_pool_device.dtype.itemsize,
-            v_row_bytes=self.mem_pool_device.qk_rope_head_dim * self.mem_pool_device.dtype.itemsize,
-            max_context_len=self.req_to_host_pool.shape[1],
-            device_buffer_row_stride=self.req_to_device_buffer.shape[1],
-            padded_buffer_size=self.padded_buffer_size,
-            max_num_reqs=max_num_reqs,
-            top_k=self.top_k,
-        )
+        group = self._prefetch_groups.get(layer_id) if self.enable_prefetch else None
+        if group:
+            # IndexShare anchor: one group-scatter launch fills this layer's
+            # and all its skip layers' device buffers (they share the slot
+            # table produced by the LRU/SIEVE call above).
+            self._lru_npu.scatter_from_host_group_npu(
+                host_kv_cache_ptr=self.host_kv_cache_base_ptr,
+                topk_indices=top_k_tokens,
+                top_k_device_slots=self.top_k_device_slots,
+                is_miss=self.is_miss,
+                req_pool_indices=req_pool_indices,
+                req_to_host_pool=self.req_to_host_pool,
+                req_to_device_buffer=self.req_to_device_buffer,
+                device_k_buffer=self.mem_pool_device.k_buffer,
+                device_v_buffer=self.mem_pool_device.v_buffer,
+                anchor_layer_id=layer_id,
+                group_size=1 + len(group),
+                host_entries=self.mem_pool_host.host_entries,
+                k_row_bytes=self.mem_pool_device.kv_lora_rank * self.mem_pool_device.dtype.itemsize,
+                v_row_bytes=self.mem_pool_device.qk_rope_head_dim * self.mem_pool_device.dtype.itemsize,
+                max_context_len=self.req_to_host_pool.shape[1],
+                device_buffer_row_stride=self.req_to_device_buffer.shape[1],
+                padded_buffer_size=self.padded_buffer_size,
+                max_num_reqs=max_num_reqs,
+                top_k=self.top_k,
+                host_entry_major=self.mem_pool_host.entry_major,
+                host_num_layers=self.mem_pool_host.num_layers,
+            )
+        else:
+            self._lru_npu.scatter_from_host_npu(
+                host_kv_cache_ptr=self.host_kv_cache_base_ptr,
+                topk_indices=top_k_tokens,
+                top_k_device_slots=self.top_k_device_slots,
+                is_miss=self.is_miss,
+                req_pool_indices=req_pool_indices,
+                req_to_host_pool=self.req_to_host_pool,
+                req_to_device_buffer=self.req_to_device_buffer,
+                device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
+                device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
+                layer_id=layer_id,
+                host_entries=self.mem_pool_host.host_entries,
+                k_row_bytes=self.mem_pool_device.kv_lora_rank * self.mem_pool_device.dtype.itemsize,
+                v_row_bytes=self.mem_pool_device.qk_rope_head_dim * self.mem_pool_device.dtype.itemsize,
+                max_context_len=self.req_to_host_pool.shape[1],
+                device_buffer_row_stride=self.req_to_device_buffer.shape[1],
+                padded_buffer_size=self.padded_buffer_size,
+                max_num_reqs=max_num_reqs,
+                top_k=self.top_k,
+                host_entry_major=self.mem_pool_host.entry_major,
+                host_num_layers=self.mem_pool_host.num_layers,
+            )
         if timed_layer:
             ev_scatter_end.record()
 
@@ -1708,7 +2017,7 @@ class HiSparseCoordinator:
             self._miss_per_req_accum[:max_num_reqs] += self.is_miss[
                 :max_num_reqs
             ].sum(dim=1)
-            if layer_id == self._layer_num - 1:
+            if layer_id == self._last_swap_layer:
                 self._stats_steps += 1
                 if self._stats_steps % self._miss_stats_interval == 0:
                     if self._stats_rank0:
@@ -1722,7 +2031,9 @@ class HiSparseCoordinator:
         self, batch_size: int, layer_id: int, req_pool_indices: torch.Tensor
     ) -> None:
         interval = self._miss_stats_interval
-        layers = self._layer_num * interval
+        # Skip layers accumulate no stats (they early-return before the
+        # LRU/scatter), so denominators count swap-in layers only.
+        layers = self._swap_layer_count * interval
         total_miss = int(self._miss_rows_accum.item())
         denom = batch_size * self.top_k * layers
         miss_rate = total_miss / denom * 100 if denom > 0 else 0.0
@@ -1748,12 +2059,12 @@ class HiSparseCoordinator:
         lru_ms_per_step = (
             sum(ev[0].elapsed_time(ev[1]) for ev in self._timing_events)
             / interval
-            * self._layer_num
+            * self._swap_layer_count
         )
         scatter_ms_per_step = (
             sum(ev[1].elapsed_time(ev[2]) for ev in self._timing_events)
             / interval
-            * self._layer_num
+            * self._swap_layer_count
         )
         scatter_bw = (
             scatter_mb_per_step / scatter_ms_per_step
