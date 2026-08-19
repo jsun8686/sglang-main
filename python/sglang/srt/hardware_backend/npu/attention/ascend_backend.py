@@ -604,14 +604,21 @@ class AscendAttnBackend(AttentionBackend):
                 max_device_slots = (
                     coordinator.padded_buffer_size + coordinator.max_decode_len
                 )
-                self.forward_metadata.actual_seq_lengths_kv = torch.minimum(
-                    forward_batch.seq_lens,
-                    torch.full_like(
-                        forward_batch.seq_lens,
-                        max_device_slots,
-                        dtype=torch.int32,
-                    ),
+                # KV length is measured in device-buffer slot space: LRU slots
+                # for prefill tokens plus one extension slot per generated
+                # token. sparse_indices reference these slots directly, so the
+                # kv length must cover the whole slot space (capped by the
+                # buffer size), otherwise extension slots are dropped as
+                # invalid by the kernel.
+                prefill_lens = coordinator.req_prefill_len[
+                    forward_batch.req_pool_indices
+                ]
+                slot_space_lens = coordinator.padded_buffer_size + (
+                    forward_batch.seq_lens - prefill_lens
                 )
+                self.forward_metadata.actual_seq_lengths_kv = torch.clamp(
+                    slot_space_lens, max=max_device_slots
+                ).to(torch.int32)
                 self.forward_metadata.actual_seq_lengths_kv_index = (
                     forward_batch.seq_lens.int()
                 )
@@ -861,15 +868,22 @@ class AscendAttnBackend(AttentionBackend):
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         if hisparse_decode:
-            # Cap attention kernel seq_len at device-buffer range;
-            # indexer sees the full uncapped seq_len.
+            # KV length is measured in device-buffer slot space: LRU slots
+            # for prefill tokens plus one extension slot per generated
+            # token. sparse_indices reference these slots directly, so the
+            # kv length must cover the whole slot space (capped by the
+            # buffer size), otherwise extension slots are dropped as
+            # invalid by the kernel. Device-side indexing only: this runs
+            # under both graph capture and replay. The indexer still sees
+            # the full uncapped seq_len.
+            prefill_lens = coordinator.req_prefill_len[req_pool_indices[:bs]]
+            slot_space_lens = coordinator.padded_buffer_size + (
+                seq_lens[:bs] - prefill_lens
+            )
             metadata.actual_seq_lengths_kv[:bs].copy_(
-                torch.minimum(
-                    seq_lens[:bs],
-                    torch.full_like(
-                        seq_lens[:bs], max_device_slots, dtype=torch.int32
-                    ),
-                )
+                torch.clamp(
+                    slot_space_lens, min=0, max=max_device_slots
+                ).to(torch.int32)
             )
             metadata.actual_seq_lengths_kv_index[:bs].copy_(
                 seq_lens[:bs].to(torch.int32)
