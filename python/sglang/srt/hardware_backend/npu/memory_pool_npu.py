@@ -347,7 +347,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.index_k_buffer = torch.zeros(
                     (
                         layer_num,
-                        self.size // self.page_size + 1,
+                        self._index_buffer_pages(),
                         self.page_size,
                         1,
                         self.index_head_dim,
@@ -357,6 +357,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
 
         self._finalize_allocation_log(size)
+
+    def _index_buffer_pages(self) -> int:
+        """Page rows in index_k_buffer. Subclasses whose index cache is
+        addressed by a different index space than the device pool (e.g.
+        HiSparse logical locations) override this."""
+        return self.size // self.page_size + 1
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -576,6 +582,12 @@ class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
         host_to_device_ratio: int = 2,
         kv_cache_dim: Optional[int] = None,
     ):
+        # Stored before super().__init__: _index_buffer_pages (called from
+        # the parent allocation) sizes the index cache by the full logical
+        # pool, so set_index_k_buffer's raw logical writes and the indexer's
+        # block_tables_index lookups stay in bounds (old-repo parity:
+        # index_buf_size = size * host_to_device_ratio).
+        self.host_to_device_ratio = host_to_device_ratio
         super().__init__(
             size=size,
             page_size=page_size,
@@ -592,6 +604,11 @@ class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
         if kv_cache_dim is not None:
             self.kv_cache_dim = kv_cache_dim
         self.bytes_per_token = self.kv_cache_dim * dtype.itemsize
+
+    def _index_buffer_pages(self) -> int:
+        return (
+            self.size * self.host_to_device_ratio // self.page_size + 1
+        )
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (
