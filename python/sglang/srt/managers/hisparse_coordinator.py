@@ -337,7 +337,11 @@ class HiSparseCoordinator:
         self.item_size_bytes = self.mem_pool_host.token_stride
         self.host_kv_cache_base_ptr = self.mem_pool_host.get_host_kv_data_ptr(0)
 
-        max_num_reqs = req_to_token_pool.size
+        # Size per-req state by the pool's actual row count, not `pool.size`:
+        # ReqToTokenPool reserves a dummy row 0 and hands out slots
+        # [1, size], so a legal req_pool_idx can reach `size`. Sizing by
+        # pool.size would make slot `size` an out-of-bounds index here.
+        max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
 
         self.req_to_device_buffer = torch.zeros(
