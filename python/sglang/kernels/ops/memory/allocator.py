@@ -133,3 +133,45 @@ def alloc_decode_kernel(
     else:
         page = tl.load(free_page_ptr + new_page_start_loc)
         tl.store(out_indices + pid, page * page_size)
+
+# HiSparse decode bookkeeping fusion (NPU/CUDA shared, triton JIT — no AOT
+# build step).  One program per request derives the decode-extension slot
+# for the current step, publishes the full->hisparse-device mapping for the
+# freshly written token, and updates the page-aligned buffer capacity:
+#     slot    = req_to_device_buffer[req_idx, padded + (seq_len-1-prefill)]
+#     mapping[out_cache_loc[pid]] = slot
+#     capacity[req_idx] = ceil((offset+1)/page)*page
+# This replaces per-step host-side index_put/index gathers (each paying
+# ~200-400us of torch-npu dispatch overhead) with a single launch.  The
+# page-boundary slot allocation itself stays on the host: it only triggers
+# every page_size steps per request and needs a cross-request page count,
+# so batching it in the kernel would cost more than it saves.
+# dtype contract: seq_lens/prefill_len are int32 (ForwardBatch convention),
+# everything else int64; offset math is widened to int64 for >32K contexts.
+@triton.jit
+def hisparse_decode_slot_kernel(
+    seq_lens_ptr,
+    req_pool_indices_ptr,
+    out_cache_loc_ptr,
+    prefill_len_ptr,
+    req_to_device_buffer_ptr,
+    capacity_ptr,
+    mapping_ptr,
+    stride_cols,
+    padded_buffer_size,
+    page_size: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    req_idx = tl.load(req_pool_indices_ptr + pid)
+    offset = (
+        tl.load(seq_lens_ptr + pid).to(tl.int64)
+        - 1
+        - tl.load(prefill_len_ptr + req_idx).to(tl.int64)
+    )
+    slot = tl.load(
+        req_to_device_buffer_ptr + req_idx * stride_cols + padded_buffer_size + offset
+    )
+    tl.store(mapping_ptr + tl.load(out_cache_loc_ptr + pid), slot)
+    tl.store(
+        capacity_ptr + req_idx, ((offset + page_size) // page_size) * page_size
+    )

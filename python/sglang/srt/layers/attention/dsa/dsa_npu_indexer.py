@@ -257,7 +257,12 @@ class DSANPUIndexerMixin:
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
-        block_table = get_attn_backend().forward_metadata.block_tables
+        attn_metadata = get_attn_backend().forward_metadata
+        block_table = attn_metadata.block_tables
+        if getattr(attn_metadata, "block_tables_index", None) is not None:
+            # HiSparse: index_k_buffer is managed by logical position, so the
+            # indexer needs a logical page table covering the full sequence.
+            block_table = attn_metadata.block_tables_index
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
@@ -280,12 +285,20 @@ class DSANPUIndexerMixin:
                 else block_table
             )
 
+            # HiSparse decode uses a truncated actual_seq_lengths_kv for the
+            # attention kernel, but the indexer must see the full sequence
+            # length.
+            if getattr(attn_metadata, "actual_seq_lengths_kv_index", None) is not None:
+                indexer_kv_len = attn_metadata.actual_seq_lengths_kv_index
+            else:
+                indexer_kv_len = actual_seq_lengths_kv
+
             topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
+                actual_seq_lengths_key=indexer_kv_len.to(k.device).to(
                     torch.int32
                 ),
                 block_table=block_table,

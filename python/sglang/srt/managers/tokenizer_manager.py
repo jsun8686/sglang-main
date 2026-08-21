@@ -1941,13 +1941,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, force: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         if (
-            not abort_all
+            not force
+            and not abort_all
             and self.server_args.tokenizer_worker_num == 1
             and rid not in self.rid_to_state
         ):
@@ -2113,12 +2116,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
             if obj.is_single:
-                self.abort_request(obj.rid)
+                self.abort_request(obj.rid, force=True)
             else:
                 for rid in obj.rid:
-                    self.abort_request(rid)
+                    self.abort_request(rid, force=True)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)

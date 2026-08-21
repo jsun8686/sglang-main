@@ -3116,6 +3116,18 @@ class Scheduler(
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            # Defensive: a request aborted while its staging DMA was still in
+            # flight may have been popped from the queue before the abort
+            # sweep saw it. Never let a finished request enter the decode
+            # batch -- release it here instead.
+            still_running = []
+            for ready_req in ready_reqs:
+                if ready_req.finished():
+                    self.hisparse_coordinator.request_finished(ready_req)
+                    release_kv_cache(ready_req, self.tree_cache, is_insert=False)
+                else:
+                    still_running.append(ready_req)
+            ready_reqs = still_running
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
                 if running_batch.is_empty():
@@ -4685,6 +4697,20 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+
+        # Abort requests sitting in the HiSparse staging window: they are in
+        # no batch yet (prefill done, staging DMA in flight), so the loops
+        # above cannot see them. Without this they become zombies that keep
+        # decoding and leak their req slots until the pool runs dry.
+        if self.enable_hisparse and self.hisparse_coordinator is not None:
+            for act in list(self.hisparse_coordinator.ack_staging_queue):
+                req = act.req
+                if not req.finished() and (
+                    recv_req.abort_all or req.rid.startswith(recv_req.rid)
+                ):
+                    prepare_abort(req, "Aborted by AbortReq.")
+                    self.hisparse_coordinator.abort_staging_request(req)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

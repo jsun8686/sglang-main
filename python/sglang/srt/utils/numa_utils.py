@@ -23,6 +23,110 @@ _is_cuda = is_cuda()
 logger = logging.getLogger(__name__)
 
 
+def get_numa_node_count() -> int:
+    return len(glob.glob("/sys/devices/system/node/node[0-9]*"))
+
+
+def get_npu_numa_node(device_id: int) -> Optional[int]:
+    """Best-effort query of the NUMA node local to an NPU die.
+
+    Scans PCI sysfs for Huawei (vendor 0x19e5) accelerator devices, sorts them
+    by BDF. Ascend 910 packs multiple dies per physical chip sharing one PCI
+    endpoint, so device_id is mapped to endpoint via ``device_id // dies_per_endpoint``
+    where ``dies_per_endpoint = ceil(num_npu_devices / num_endpoints)``.
+    Returns None when the mapping cannot be determined.
+    """
+    try:
+        devices = []
+        for path in glob.glob("/sys/bus/pci/devices/*"):
+            try:
+                with open(os.path.join(path, "vendor")) as f:
+                    if f.read().strip() != "0x19e5":
+                        continue
+                with open(os.path.join(path, "class")) as f:
+                    if not f.read().strip().startswith("0x1200"):
+                        continue
+                with open(os.path.join(path, "numa_node")) as f:
+                    node = int(f.read().strip())
+                if node >= 0:
+                    devices.append((os.path.basename(path), node))
+            except (OSError, ValueError):
+                continue
+        devices.sort()
+        if devices and device_id >= 0:
+            num_endpoints = len(devices)
+            try:
+                num_npu_devices = torch.npu.device_count()
+            except Exception:
+                num_npu_devices = num_endpoints
+            dies_per_endpoint = max(
+                1, (num_npu_devices + num_endpoints - 1) // num_endpoints
+            )
+            endpoint_idx = min(
+                device_id // dies_per_endpoint, num_endpoints - 1
+            )
+            logger.info(
+                "get_npu_numa_node: device_id %d -> endpoint %d "
+                "(dies_per_endpoint=%d, num_endpoints=%d, numa_node=%d)",
+                device_id,
+                endpoint_idx,
+                dies_per_endpoint,
+                num_endpoints,
+                devices[endpoint_idx][1],
+            )
+            return devices[endpoint_idx][1]
+    except Exception:
+        pass
+    return None
+
+
+@contextmanager
+def temp_membind(node: int):
+    """Hard-bind page allocations to a NUMA node; restored on exit."""
+    libnuma = get_libnuma()
+    if libnuma is None or libnuma.numa_available() < 0:
+        logger.warning("numa not available, skip temp_membind to node %d", node)
+        yield
+        return
+    libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
+    libnuma.numa_get_membind.restype = ctypes.c_void_p
+    libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]
+    libnuma.numa_bitmask_setbit.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    libnuma.numa_bitmask_free.argtypes = [ctypes.c_void_p]
+    libnuma.numa_set_bind_policy.argtypes = [ctypes.c_int]
+    target = libnuma.numa_allocate_nodemask()
+    libnuma.numa_bitmask_setbit(target, node)
+    prev = libnuma.numa_get_membind()
+    libnuma.numa_set_bind_policy(1)
+    libnuma.numa_set_membind(target)
+    try:
+        yield
+    finally:
+        libnuma.numa_set_membind(prev)
+        libnuma.numa_set_bind_policy(0)
+        libnuma.numa_bitmask_free(target)
+
+
+def get_shm_numa_distribution(shm_path: str) -> dict:
+    """Per-NUMA-node page counts for VMAs backed by the given shm file."""
+    dist = {}
+    try:
+        with open("/proc/self/numa_maps") as f:
+            for line in f:
+                if shm_path not in line:
+                    continue
+                for tok in line.split():
+                    if tok.startswith("N") and "=" in tok:
+                        node, _, pages = tok[1:].partition("=")
+                        try:
+                            dist[int(node)] = dist.get(int(node), 0) + int(pages)
+                        except ValueError:
+                            continue
+    except OSError:
+        pass
+    return dist
+
+
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
     if envs.SGLANG_NUMA_BIND_V2.get():
