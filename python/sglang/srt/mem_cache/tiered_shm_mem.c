@@ -7,7 +7,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
-#include <acl/acl.h>
+#include <acl/acl_base.h>
+#include <acl/acl_rt.h>
 
 // ==========================================
 // 结构体与宏定义
