@@ -91,6 +91,11 @@ class ForwardMetadata:
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
 
+    # HiSparse: logical page table for the indexer (full sequence), and the
+    # full (uncapped) seq lengths for the indexer.
+    block_tables_index: Optional[torch.Tensor] = None
+    actual_seq_lengths_kv_index: Optional[torch.Tensor] = None
+
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
 
@@ -465,6 +470,46 @@ class AscendAttnBackend(AttentionBackend):
             ][:, :: self.page_size]
             // self.page_size
         )
+
+        # HiSparse detection: the KV pool has full_to_hisparse_device_index_mapping
+        is_hisparse = hasattr(
+            self.token_to_kv_pool, "full_to_hisparse_device_index_mapping"
+        )
+        if is_hisparse:
+            coordinator = getattr(forward_batch, "hisparse_coordinator", None)
+            if (
+                forward_batch.forward_mode.is_decode()
+                and coordinator is not None
+            ):
+                # HiSparse decode: build device-buffer page table
+                max_device_slots = (
+                    coordinator.padded_buffer_size + coordinator.max_decode_len
+                )
+                self.forward_metadata.block_tables = (
+                    coordinator.req_to_device_buffer[
+                        forward_batch.req_pool_indices, :max_device_slots,
+                    ][:, :: self.page_size] // self.page_size
+                ).to(torch.int32).contiguous()
+            else:
+                # HiSparse prefill: map logical positions to physical pages
+                logical_indices = self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :seq_lens_max
+                ]
+                physical_indices = (
+                    self.token_to_kv_pool.full_to_hisparse_device_index_mapping[
+                        logical_indices
+                    ]
+                )
+                self.forward_metadata.block_tables = (
+                    physical_indices[:, :: self.page_size] // self.page_size
+                ).to(torch.int32).contiguous()
+        else:
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :seq_lens_max
+                ][:, :: self.page_size]
+                // self.page_size
+            )
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -571,11 +616,33 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
-            )
+                )
+
+        if is_hisparse:
+            coordinator = getattr(forward_batch, "hisparse_coordinator", None)
+            if (
+                forward_batch.forward_mode.is_decode()
+                and coordinator is not None
+            ):
+                max_device_slots = (
+                    coordinator.padded_buffer_size + coordinator.max_decode_len
+                )
+                self.forward_metadata.actual_seq_lengths_kv = torch.minimum(
+                    forward_batch.seq_lens,
+                    torch.full_like(
+                        forward_batch.seq_lens,
+                        max_device_slots,
+                        dtype=torch.int32,
+                    ),
+                )
+                self.forward_metadata.actual_seq_lengths_kv_index = (
+                    forward_batch.seq_lens.int()
+                )
 
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        self.max_bs = max_bs
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -633,6 +700,38 @@ class AscendAttnBackend(AttentionBackend):
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+
+        # HiSparse graph buffers: lazily allocated on first decode capture.
+        coordinator = getattr(self.model_runner, "hisparse_coordinator", None)
+        if coordinator is not None and forward_mode.is_decode():
+            if "block_tables_index" not in self.graph_metadata:
+                max_pages = self.graph_metadata["block_tables"].shape[1]
+                self.graph_metadata["block_tables_index"] = torch.zeros(
+                    (self.max_bs, max_pages), dtype=torch.int32, device=self.device
+                )
+                self.graph_metadata["actual_seq_lengths_kv"] = torch.zeros(
+                    (self.max_bs,), dtype=torch.int32, device=self.device
+                )
+                self.graph_metadata["actual_seq_lengths_kv_index"] = torch.zeros(
+                    (self.max_bs,), dtype=torch.int32, device=self.device
+                )
+            max_device_slots = (
+                coordinator.padded_buffer_size + coordinator.max_decode_len
+            )
+            num_dev_pages = max_device_slots // self.page_size
+            metadata.block_tables = self.graph_metadata["block_tables"][
+                :bs, :num_dev_pages
+            ]
+            metadata.block_tables.zero_()
+            metadata.block_tables_index = self.graph_metadata["block_tables_index"][
+                :bs, :
+            ]
+            metadata.actual_seq_lengths_kv = self.graph_metadata[
+                "actual_seq_lengths_kv"
+            ][:bs]
+            metadata.actual_seq_lengths_kv_index = self.graph_metadata[
+                "actual_seq_lengths_kv_index"
+            ][:bs]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
@@ -747,19 +846,60 @@ class AscendAttnBackend(AttentionBackend):
             )
             metadata.swa_mask[:bs, 0, :].copy_(mask)
             metadata.swa_mask[bs:, :, :].fill_(True)
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-            // self.page_size
-        )
+        coordinator = getattr(self.model_runner, "hisparse_coordinator", None)
+        hisparse_decode = coordinator is not None and forward_mode.is_decode()
 
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
+        if hisparse_decode:
+            max_device_slots = (
+                coordinator.padded_buffer_size + coordinator.max_decode_len
+            )
+            # block_tables: device-buffer physical pages (for attention kernel)
+            metadata.block_tables.copy_(
+                (
+                    coordinator.req_to_device_buffer[
+                        req_pool_indices[:bs], :max_device_slots
+                    ][:, :: self.page_size] // self.page_size
+                ).to(torch.int32)
+            )
+            # block_tables_index: logical page table (for the indexer)
+            metadata.block_tables_index[:bs, :max_seq_pages].copy_(
+                (
+                    self.req_to_token[req_pool_indices[:bs], :max_len][
+                        :, :: self.page_size
+                    ]
+                    // self.page_size
+                ).to(torch.int32)
+            )
+            metadata.block_tables_index[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables_index[bs:, :].fill_(0)
+        else:
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+                // self.page_size
+            )
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+
+        if hisparse_decode:
+            # Cap attention kernel seq_len at device-buffer range;
+            # indexer sees the full uncapped seq_len.
+            metadata.actual_seq_lengths_kv[:bs].copy_(
+                torch.minimum(
+                    seq_lens[:bs],
+                    torch.full_like(
+                        seq_lens[:bs], max_device_slots, dtype=torch.int32
+                    ),
+                )
+            )
+            metadata.actual_seq_lengths_kv_index[:bs].copy_(
+                seq_lens[:bs].to(torch.int32)
+            )
 
         self.forward_metadata = metadata
 
@@ -2526,6 +2666,26 @@ class AscendAttnBackend(AttentionBackend):
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:
+            if forward_batch.hisparse_coordinator is not None:
+                page_table_1 = (
+                    forward_batch.hisparse_coordinator.swap_in_selected_pages(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        topk_indices,
+                        layer.layer_id,
+                    )
+                )
+                return self.forward_sparse(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope,
+                    k_rope,
+                    topk_indices=page_table_1,
+                )
             return self.forward_sparse(
                 q,
                 k,

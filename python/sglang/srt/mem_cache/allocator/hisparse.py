@@ -127,11 +127,38 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
         )
 
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
+    def alloc_device_buffer(
+        self, allocated_indices, need_size: int, head_keep: int = 0, tail_keep: int = 0
+    ):
         assert need_size % self.page_size == 0
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
+        # clear original reference and isolate the buffer from outside addressing
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        if head_keep > 0 or tail_keep > 0:
+            # Long sequences: keep the first head_keep and last tail_keep
+            # slots (page-aligned head/tail of the device buffer) and release
+            # the middle; the rest is claimed fresh from the allocator.
+            assert head_keep + tail_keep <= len(hisparse_indices)
+            assert (head_keep + tail_keep) % self.page_size == 0
+            tail_start = (
+                len(hisparse_indices) - tail_keep
+                if tail_keep > 0
+                else len(hisparse_indices)
+            )
+            keep_indices = torch.cat(
+                [hisparse_indices[:head_keep], hisparse_indices[tail_start:]]
+            )
+            middle_indices = hisparse_indices[head_keep:tail_start]
+            if middle_indices.numel() > 0:
+                self.free_hisparse_indices(middle_indices)
+            extra_indices = self.hisparse_attn_allocator.alloc(
+                need_size - len(keep_indices)
+            )
+            assert extra_indices is not None, (
+                "Hisparse allocation failed in alloc_device_buffer"
+            )
+            buffer_indices = torch.cat([keep_indices, extra_indices])
+            return buffer_indices
         # Filter valid (non-zero) hisparse indices.
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
