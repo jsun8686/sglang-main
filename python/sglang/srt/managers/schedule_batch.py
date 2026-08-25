@@ -2798,7 +2798,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_algorithm.is_none():
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
-            return new_pages * page_size
+            num_tokens = new_pages * page_size
+            coordinator = self.hisparse_coordinator
+            if coordinator is not None and coordinator.is_npu:
+                # The NPU hisparse path claims device-pool pages on a
+                # different boundary predicate ((kv_committed_len - prefill_len)
+                # % page_size == 0) than the logical pool (kv_committed_len %
+                # page_size == 0). check_decode_mem compares against
+                # min(logical, hisparse) available tokens, so the requirement
+                # must cover both pools.
+                num_tokens = max(
+                    num_tokens,
+                    coordinator.new_decode_buffer_tokens_required(requests),
+                )
+            return num_tokens
 
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 

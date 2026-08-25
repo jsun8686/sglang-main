@@ -690,6 +690,31 @@ class HiSparseCoordinator:
             ),
         )
 
+    def new_decode_buffer_tokens_required(self, requests: List[Req]) -> int:
+        """Predict the hisparse device-pool tokens the next decode step claims.
+
+        Mirrors the page-boundary predicate of
+        _alloc_decode_buffer_slot_{fused,torch}: one page of device-buffer
+        slots per request whose (kv_committed_len - prefill_len) % page_size
+        == 0, with kv_committed_len read at check time (before
+        prepare_for_decode's increment; the coordinator-side offset
+        seq_lens - 1 - prefill_len equals this expression once seq_lens was
+        bumped). The generic kv_committed_len % page_size criterion used by
+        check_decode_mem diverges whenever prefill_len is not page-aligned —
+        e.g. after a retraction resume — undercounting the demand so the
+        scheduler crashes on pool exhaustion instead of retracting.
+        """
+        if self.max_decode_len <= 0:
+            return 0
+        page_size = self.token_to_kv_pool_allocator.page_size
+        prefill_lens = self.req_prefill_len_cpu
+        new_pages = sum(
+            1
+            for r in requests
+            if (r.kv_committed_len - int(prefill_lens[r.req_pool_idx])) % page_size == 0
+        )
+        return new_pages * page_size
+
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
         if self.is_npu:
@@ -914,9 +939,6 @@ class HiSparseCoordinator:
 
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs: List[Req] = []
-        if len(self.ack_staging_queue) == 0:
-            return ready_reqs
-
         finish_count = 0
         for _, finish_event, _ in self.ack_staging_queue:
             if not finish_event.query():
@@ -924,7 +946,15 @@ class HiSparseCoordinator:
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         if self.tp_world_size > 1:
-            # synchronize TP workers to make sure the same update to scheduler
+            # synchronize TP workers to make sure the same update to scheduler.
+            # Every rank must enter this collective on every call, including
+            # ranks whose staging queue is empty (they contribute 0): staging
+            # admission and event-completion timing differ per rank, so an
+            # early return on an empty local queue splits ranks between
+            # "inside this collective" and "moved on to the next one",
+            # deadlocking TP until the watchdog fires (sglang#23288). MIN
+            # keeps the pop set aligned: only the prefix whose staging
+            # completed on ALL ranks pops.
             torch.distributed.all_reduce(
                 queue_size,
                 op=torch.distributed.ReduceOp.MIN,
