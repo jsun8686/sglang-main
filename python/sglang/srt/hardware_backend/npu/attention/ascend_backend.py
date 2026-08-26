@@ -464,7 +464,17 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_max = forward_batch.seq_lens.max()
             seq_lens_max += self.speculative_step_id + 1
         else:
-            seq_lens_max = forward_batch.seq_lens.max()
+            # Same overlap hazard as the target-verify branch above: the CPU
+            # mirror can be published one step ahead of the device seq_lens
+            # tensor, and the attention kernels consume KV lengths derived
+            # from seq_lens_cpu (seq_lens_cpu_int -> actual_seq_lengths_kv).
+            # Build the table width from the same mirror; a width derived
+            # from the lagging device tensor lets the kernel read past the
+            # table end (MTE DDR out-of-range).
+            if forward_batch.seq_lens_cpu is not None:
+                seq_lens_max = forward_batch.seq_lens_cpu.max().item()
+            else:
+                seq_lens_max = int(forward_batch.seq_lens.max().item())
         self.forward_metadata.block_tables = (
             self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
@@ -965,6 +975,33 @@ class AscendAttnBackend(AttentionBackend):
         )
         return torch.cat([topk_indices, padding], dim=0)
 
+    def _check_sparse_table_bounds(
+        self, actual_seq_lengths_kv: Optional[torch.Tensor]
+    ) -> None:
+        # Tripwire for block-table width vs kernel KV length. The eager path
+        # feeds npu_sparse_flash_attention actual_seq_lengths_kv from the CPU
+        # mirror, so a width/kernel divergence is detectable here (no device
+        # sync) before the kernel walks past the table end and wedges the die
+        # with an MTE DDR out-of-range read. Device-resident lengths (hisparse
+        # decode capped slot lens) are skipped to avoid a sync; their tables
+        # are built against the same slot-space bound.
+        block_tables = self.forward_metadata.block_tables
+        if (
+            block_tables is None
+            or actual_seq_lengths_kv is None
+            or actual_seq_lengths_kv.device.type != "cpu"
+        ):
+            return
+        max_kv_len = int(actual_seq_lengths_kv.max().item())
+        table_capacity = block_tables.shape[1] * self.page_size
+        if max_kv_len > table_capacity:
+            raise RuntimeError(
+                f"Ascend sparse attention block table too narrow: max kv len "
+                f"{max_kv_len} > table capacity {table_capacity} "
+                f"({block_tables.shape[1]} cols x page_size "
+                f"{self.page_size}); seq_lens device/CPU sources diverged"
+            )
+
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
 
@@ -1319,6 +1356,7 @@ class AscendAttnBackend(AttentionBackend):
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
+            self._check_sparse_table_bounds(actual_seq_lengths_kv)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
