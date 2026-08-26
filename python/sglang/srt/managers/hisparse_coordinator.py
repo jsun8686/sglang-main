@@ -1493,9 +1493,16 @@ class HiSparseCoordinator:
                 self.mem_pool_device, host_indices[:prefill_len], device_indices
             )
             finish_event.record()
-            if host_indices.is_cuda:
+            # The staging DMA consumes these index tensors on
+            # write_staging_stream while they were produced on the scheduler
+            # stream. Without record_stream the caching allocator can recycle
+            # their storage once this function returns, and the still-running
+            # DMA reads reused memory. The is_cuda guard used on the GPU path
+            # is always False here, so check the device type instead (same
+            # hazard, same fix as admit_request_into_staging on CUDA).
+            if host_indices.device.type != "cpu":
                 host_indices.record_stream(self.write_staging_stream)
-            if device_indices.is_cuda:
+            if device_indices.device.type != "cpu":
                 device_indices.record_stream(self.write_staging_stream)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
