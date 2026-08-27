@@ -398,6 +398,11 @@ class TieredHostMemoryPool:
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
     ):
+        # Crash-bisect switch: HISPARSE_BYPASS_BACKUP=1 skips every device->host
+        # backup DMA (kernel and fallback paths) while keeping the pool's
+        # alloc/free bookkeeping intact.
+        if os.environ.get("HISPARSE_BYPASS_BACKUP", "0") == "1":
+            return
         if self.entry_major and str(device_pool.device).startswith("npu"):
             self._backup_to_host_kernel(device_pool, host_indices, device_indices)
             return

@@ -456,6 +456,12 @@ class HiSparseCoordinator:
         self._bypass_swap = os.environ.get("HISPARSE_BYPASS_SWAP", "0") == "1"
         self._bypass_swap_1 = os.environ.get("HISPARSE_BYPASS_SWAP_1", "0") == "1"
         self._bypass_swap_2 = os.environ.get("HISPARSE_BYPASS_SWAP_2", "0") == "1"
+        # Experiment S: serialize the NPU staging backup with all other
+        # device work (full-device sync before and after) so the backup
+        # kernel never shares AIV/MTE engines with prefill compute.
+        self._serialize_backup = (
+            os.environ.get("HISPARSE_SERIALIZE_BACKUP", "0") == "1"
+        )
 
         # M5: fused decode-slot bookkeeping — one triton launch replaces the
         # per-step host-side scatter/gather ops of the M4 torch path.
@@ -1486,24 +1492,39 @@ class HiSparseCoordinator:
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
-        start_event.record()
-        with device_module.stream(self.write_staging_stream):
-            start_event.wait(self.write_staging_stream)
+        if self._serialize_backup:
+            # Experiment S: drain all in-flight device work, run the staging
+            # backup alone on the current stream, and wait for it to finish
+            # before this thread enqueues anything else.  The backup kernel
+            # therefore never runs concurrently with prefill compute (no
+            # shared AIV/MTE engine usage).  Diagnostic switch for the
+            # prefill-hang investigation; costs a pipeline stall per admit.
+            device_module.synchronize()
+            start_event.record()
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices[:prefill_len], device_indices
             )
             finish_event.record()
-            # The staging DMA consumes these index tensors on
-            # write_staging_stream while they were produced on the scheduler
-            # stream. Without record_stream the caching allocator can recycle
-            # their storage once this function returns, and the still-running
-            # DMA reads reused memory. The is_cuda guard used on the GPU path
-            # is always False here, so check the device type instead (same
-            # hazard, same fix as admit_request_into_staging on CUDA).
-            if host_indices.device.type != "cpu":
-                host_indices.record_stream(self.write_staging_stream)
-            if device_indices.device.type != "cpu":
-                device_indices.record_stream(self.write_staging_stream)
+            device_module.synchronize()
+        else:
+            start_event.record()
+            with device_module.stream(self.write_staging_stream):
+                start_event.wait(self.write_staging_stream)
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device, host_indices[:prefill_len], device_indices
+                )
+                finish_event.record()
+                # The staging DMA consumes these index tensors on
+                # write_staging_stream while they were produced on the scheduler
+                # stream. Without record_stream the caching allocator can recycle
+                # their storage once this function returns, and the still-running
+                # DMA reads reused memory. The is_cuda guard used on the GPU path
+                # is always False here, so check the device type instead (same
+                # hazard, same fix as admit_request_into_staging on CUDA).
+                if host_indices.device.type != "cpu":
+                    host_indices.record_stream(self.write_staging_stream)
+                if device_indices.device.type != "cpu":
+                    device_indices.record_stream(self.write_staging_stream)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
