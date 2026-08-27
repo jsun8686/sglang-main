@@ -331,7 +331,7 @@ class HiSparseCoordinator:
             host_to_device_ratio=host_to_device_ratio,
             shm_name=f"hisparse_npu_{os.getpid()}",
             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
-            block_size=self.top_k,
+            block_size=self.page_size,
             numa_node=self._resolve_numa_node(),
         )
         self.item_size_bytes = self.mem_pool_host.token_stride
