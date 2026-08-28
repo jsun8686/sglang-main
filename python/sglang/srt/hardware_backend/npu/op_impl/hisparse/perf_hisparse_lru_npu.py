@@ -31,6 +31,11 @@ Run on an NPU host:
     python perf_hisparse_lru_npu.py                     # legacy + A/B (8 layers)
     python perf_hisparse_lru_npu.py --skip-legacy       # A/B only
     python perf_hisparse_lru_npu.py --num-layers 78     # production scale
+    python perf_hisparse_lru_npu.py --graph             # + NPU-graph replay arm
+
+--graph captures the timed unit (update + scatter) into torch.npu graphs and
+times replay vs eager (same reset-per-iteration methodology), isolating the
+per-op host launch overhead on NPU.
 """
 
 import argparse
@@ -221,6 +226,53 @@ def _run_update(algo, state, block_dim, num_reqs, top_k, device_buffer_size):
         )
 
 
+def _scatter_call(state, host_kv_dev, block_dim, num_reqs, top_k, device_buffer_size):
+    """Standalone scatter invocation (same args as the eager timing loop) so
+    the graph arm can capture it as its own graph."""
+    scatter_from_host_npu(
+        host_kv_cache_ptr=host_kv_dev,
+        topk_indices=state["topk_indices"],
+        top_k_device_slots=state["top_k_device_slots"],
+        is_miss=state["is_miss"],
+        req_pool_indices=state["req_pool_indices"],
+        req_to_host_pool=state["req_to_host_pool"],
+        req_to_device_buffer=state["req_to_device_buffer"],
+        device_k_buffer=state["device_k_buffer"],
+        device_v_buffer=state["device_v_buffer"],
+        layer_id=0,
+        host_entries=MAX_CONTEXT_LEN,
+        k_row_bytes=K_ROW_BYTES,
+        v_row_bytes=V_ROW_BYTES,
+        max_context_len=MAX_CONTEXT_LEN,
+        device_buffer_row_stride=PADDED_BUFFER_SIZE + MAX_DECODE_LEN,
+        padded_buffer_size=PADDED_BUFFER_SIZE,
+        max_num_reqs=num_reqs,
+        top_k=top_k,
+        block_dim=block_dim,
+    )
+
+
+def _capture_graph(run_fn):
+    """Capture run_fn into a torch.npu.NPUGraph using the same mechanism as
+    NPUGraphRunner / test_graph_capture_replay: side-stream warmup, then
+    capture with auto_dispatch_capture=True so the raw ACLRT_LAUNCH_KERNEL
+    launches of the hisparse_lru extension are captured as well.
+    Returns None when capture is unsupported for this op combination."""
+    side = torch.npu.Stream()
+    side.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(side):
+        run_fn()
+    torch.npu.current_stream().wait_stream(side)
+
+    graph = torch.npu.NPUGraph()
+    try:
+        with torch.npu.graph(graph, auto_dispatch_capture=True):
+            run_fn()
+    except RuntimeError:
+        return None
+    return graph
+
+
 def _run_once(state, block_dim, host_kv_dev_ptr,
               num_reqs, top_k, device_buffer_size, algo="lru"):
     _run_update(algo, state, block_dim, num_reqs, top_k, device_buffer_size)
@@ -248,7 +300,7 @@ def _run_once(state, block_dim, host_kv_dev_ptr,
 
 
 def _run_scenario(device, num_reqs, top_k, device_buffer_size, miss_ratio,
-                  host_kv_dev):
+                  host_kv_dev, use_graph=False):
     device_rows = num_reqs * (PADDED_BUFFER_SIZE + MAX_DECODE_LEN)
     print(f"scenario: reqs={num_reqs} top_k={top_k} dbs={device_buffer_size} "
           f"padded={PADDED_BUFFER_SIZE} miss_ratio={miss_ratio} | "
@@ -256,6 +308,7 @@ def _run_scenario(device, num_reqs, top_k, device_buffer_size, miss_ratio,
 
     state = _make_state(device, num_reqs, top_k, device_buffer_size)
     init_tokens_row = torch.arange(device_buffer_size, dtype=torch.int32, device=device)
+    eager_totals = {}
 
     for algo in ALGOS:
       for block_dim in BLOCK_DIMS:
@@ -305,6 +358,7 @@ def _run_scenario(device, num_reqs, top_k, device_buffer_size, miss_ratio,
 
         avg_lru = sum(lru_ms) / len(lru_ms)
         avg_scatter = sum(scatter_ms) / len(scatter_ms)
+        eager_totals[(algo, block_dim)] = avg_lru + avg_scatter
         miss_bytes = miss_rows * (K_ROW_BYTES + V_ROW_BYTES)
         bw_gbps = miss_bytes / (avg_scatter / 1000.0) / 2**30 if avg_scatter > 0 else 0.0
         tag = "auto" if block_dim == 0 else f"{block_dim:4d}"
@@ -313,6 +367,66 @@ def _run_scenario(device, num_reqs, top_k, device_buffer_size, miss_ratio,
               f"(min {min(scatter_ms):8.3f}) | miss {miss_rows} rows "
               f"({miss_bytes / 2**20:.1f} MiB, {bw_gbps:6.2f} GiB/s) | "
               f"total {avg_lru + avg_scatter:9.3f} ms")
+
+    if use_graph:
+        # Graph-replay arm: the timed unit (update + scatter) is captured into
+        # two graphs so each replay re-executes the kernels with whatever the
+        # (eager, untimed) reset put into the captured input tensors.  Timing
+        # and per-iteration state reset match the eager arm exactly, so the
+        # eager-vs-graph delta isolates the per-op host launch overhead.
+        for algo in ALGOS:
+          for block_dim in BLOCK_DIMS:
+            g_update = _capture_graph(
+                lambda: _run_update(algo, state, block_dim, num_reqs, top_k,
+                                    device_buffer_size)
+            )
+            g_scatter = _capture_graph(
+                lambda: _scatter_call(state, host_kv_dev, block_dim, num_reqs,
+                                      top_k, device_buffer_size)
+            )
+            tag = "auto" if block_dim == 0 else f"{block_dim:4d}"
+            if g_update is None or g_scatter is None:
+                print(f"[graph] algo={algo:5s} block_dim={tag}: "
+                      "capture unsupported, skipped")
+                del g_update, g_scatter
+                continue
+
+            lru_ms, scatter_ms = [], []
+            for it in range(WARMUP + ITERS):
+                _reset_state(state, init_tokens_row, device_buffer_size, num_reqs, top_k)
+                state["topk_indices"].copy_(
+                    _gen_topk(device, num_reqs, top_k, device_buffer_size, miss_ratio))
+
+                ev_start = torch.npu.Event(enable_timing=True)
+                ev_mid = torch.npu.Event(enable_timing=True)
+                ev_end = torch.npu.Event(enable_timing=True)
+                ev_start.record()
+                g_update.replay()
+                ev_mid.record()
+                g_scatter.replay()
+                ev_end.record()
+                torch.npu.synchronize()
+                if it >= WARMUP:
+                    lru_ms.append(ev_start.elapsed_time(ev_mid))
+                    scatter_ms.append(ev_mid.elapsed_time(ev_end))
+
+            avg_lru = sum(lru_ms) / len(lru_ms)
+            avg_scatter = sum(scatter_ms) / len(scatter_ms)
+            g_total = avg_lru + avg_scatter
+            miss_rows = int(state["is_miss"].sum().item())
+            e_total = eager_totals.get((algo, block_dim))
+            delta = ""
+            if e_total:
+                d = e_total - g_total
+                delta = f" | Δ {d:+9.3f} ms ({d / e_total * 100:+.0f}% vs eager)"
+            print(f"[graph] algo={algo:5s} block_dim={tag} | upd {avg_lru:9.3f} ms "
+                  f"(min {min(lru_ms):9.3f}) | scatter {avg_scatter:8.3f} ms "
+                  f"(min {min(scatter_ms):8.3f}) | miss {miss_rows} rows "
+                  f"| total {g_total:9.3f} ms{delta}")
+            # Free this combo's graphs before capturing the next one so at
+            # most two graphs are alive at any time.
+            del g_update, g_scatter
+            torch.npu.synchronize()
 
     # Correctness sanity: one extra run per algo verified against expected miss count.
     for algo in ALGOS:
@@ -354,6 +468,13 @@ def main():
         "--skip-legacy", action="store_true", help="skip the original scenarios"
     )
     parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="add an NPU-graph replay arm per scenario: capture update+scatter "
+        "into torch.npu graphs and time replay vs eager to isolate the per-op "
+        "host launch overhead",
+    )
+    parser.add_argument(
         "--backup-tokens",
         type=int,
         default=BACKUP_TOKENS_DEFAULT,
@@ -374,7 +495,7 @@ def main():
         try:
             for num_reqs, top_k, device_buffer_size, miss_ratio in SCENARIOS:
                 _run_scenario(device, num_reqs, top_k, device_buffer_size, miss_ratio,
-                              host_kv_dev)
+                              host_kv_dev, use_graph=args.graph)
             print("perf benchmark done.")
         finally:
             _acl_free_host(host_kv_ptr, host_kv_dev, host_kv_size)
